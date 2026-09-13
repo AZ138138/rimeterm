@@ -104,11 +104,18 @@ external-edit detection, completion, filtering, recurrence, and archival.
 
 Grab the installer for your platform from the [latest release] — MSI on Windows, `.deb` on Debian/Ubuntu, or a `.dmg` on macOS (Apple Silicon). Nothing else ships alongside — a single `rimeterm` + `rimectl` binary is the entire payload.
 
-From source:
+On Linux the `.deb` is linked against glibc 2.31, so it installs on Ubuntu 20.04+ / Debian 11+ — including WSL images:
 
 ```bash
-cargo install --path crates/rimeterm --bin rimeterm
-cargo install --path crates/rimectl  --bin rimectl
+curl -LO https://github.com/caozisheng/rimeterm/releases/latest/download/rimeterm-<version>_amd64.deb
+sudo apt install ./rimeterm-<version>_amd64.deb
+```
+
+From source (note `--locked`: the committed `Cargo.lock` is currently required — `bisync 0.3.x`, a transitive `gix` dependency, is yanked on crates.io, so fresh resolution fails):
+
+```bash
+cargo install --path crates/rimeterm --bin rimeterm --locked
+cargo install --path crates/rimectl  --bin rimectl  --locked
 ```
 
 Then run `rimeterm` from any terminal.
