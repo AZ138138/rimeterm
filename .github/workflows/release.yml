@@ -170,9 +170,45 @@ jobs:
           rm -f Cargo.toml.bak
 
       # One cargo invocation so incremental linking + parallel codegen share
-      # work across both binaries.
+      # work across both binaries (macOS / Windows).
       - name: Cargo build --release (rimeterm + rimectl)
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
+
+      # Linux: link against an older glibc with cargo-zigbuild so the .deb
+      # installs on Ubuntu 20.04+ / Debian 11+ (including the WSL images
+      # many users run). A plain build on ubuntu-latest baked glibc 2.39
+      # into the binary, which excluded every distro older than 24.04.
+      # zigbuild writes to the usual target/<triple>/release/ directory
+      # (no glibc-suffix), so `cargo deb --no-build --target` below is
+      # unchanged. Versions pinned to the combo validated for v0.2.44.
+      - name: Install cargo-zigbuild + zig (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          pip3 install --user ziglang==0.16.0
+          python3 -m ziglang version
+          cargo install cargo-zigbuild --locked --version ^0.23
+
+      - name: Cargo zigbuild --release, glibc 2.31 (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo zigbuild --release --workspace --bins --target x86_64-unknown-linux-gnu.2.31
+
+      # Guard the baseline: if a future dependency drags in symbols newer
+      # than 2.31, the .deb silently stops installing on Ubuntu 20.04/WSL
+      # again. readelf walks .gnu.version_r; awk does a numeric compare.
+      - name: Verify glibc symbol baseline (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/x86_64-unknown-linux-gnu/release/rimeterm"
+          MAX_GLIBC="$(readelf --version-info "$BIN" \
+            | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu | tail -n1 | cut -d_ -f3)"
+          echo "max GLIBC symbol: ${MAX_GLIBC}"
+          if awk -v v="${MAX_GLIBC}" 'BEGIN { exit !(v > 2.31) }'; then
+            echo "::error::glibc baseline regressed (${MAX_GLIBC} > 2.31) - the .deb would no longer install on Ubuntu 20.04/WSL"
+            exit 1
+          fi
 
       # C25: essentials fetch retired. Files, git, and sysmon are all
       # Native panes now — zero external binaries ship with rimeterm.
