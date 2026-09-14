@@ -242,13 +242,19 @@ impl SelectionState {
 pub fn extract_text<T>(term: &Term<T>, sel: &SelectionState) -> Option<String> {
     let (start, end) = sel.char_range()?;
     let cols = term.grid().columns() as u16;
+    // Viewport row `r` displays grid line `r - display_offset` (the
+    // render path's `display_iter` starts at `Line(-display_offset)`).
+    // Scrollback panes have offset > 0, so every grid lookup below must
+    // go through the same conversion or the copied text diverges from
+    // the highlight.
+    let offset = term.grid().display_offset() as i32;
     let mut out = String::new();
 
     for row in start.row..=end.row {
         let (row_start, row_end) = row_bounds(sel, row, start, end, cols);
-        let line_wrapped = row_is_wrapped(term, row, cols);
+        let line_wrapped = row_is_wrapped(term, row, cols, offset);
         let mut row_str = String::new();
-        let line: i32 = row.into();
+        let line = row as i32 - offset;
 
         for col in row_start..=row_end {
             let point = Point::new(Line(line), Column(col as usize));
@@ -293,11 +299,11 @@ fn row_bounds(sel: &SelectionState, row: u16, start: Cell, end: Cell, cols: u16)
 
 /// True when `row` ends on a cell whose `WRAPLINE` flag is set. That's
 /// alacritty's way of marking "row continues into row+1 mid-token".
-fn row_is_wrapped<T>(term: &Term<T>, row: u16, cols: u16) -> bool {
+fn row_is_wrapped<T>(term: &Term<T>, row: u16, cols: u16, offset: i32) -> bool {
     if cols == 0 {
         return false;
     }
-    let line: i32 = row.into();
+    let line = row as i32 - offset;
     let point = Point::new(Line(line), Column((cols - 1) as usize));
     term.grid()[point].flags.contains(Flags::WRAPLINE)
 }
@@ -310,11 +316,12 @@ pub fn snap_to_word<T>(sel: &mut SelectionState, term: &Term<T>) {
         return;
     };
     let cols = term.grid().columns() as u16;
+    let offset = term.grid().display_offset() as i32;
 
     // Snap the anchor leftward.
-    let left = word_boundary_left(term, anchor.row, anchor.col, cols);
+    let left = word_boundary_left(term, anchor.row, anchor.col, cols, offset);
     // Snap the cursor rightward (may equal anchor on a fresh double-click).
-    let right = word_boundary_right(term, anchor.row, anchor.col, cols);
+    let right = word_boundary_right(term, anchor.row, anchor.col, cols, offset);
     sel.anchor = Some(Cell {
         row: anchor.row,
         col: left,
@@ -325,8 +332,8 @@ pub fn snap_to_word<T>(sel: &mut SelectionState, term: &Term<T>) {
     };
 }
 
-fn word_boundary_left<T>(term: &Term<T>, row: u16, col: u16, cols: u16) -> u16 {
-    let line: i32 = row.into();
+fn word_boundary_left<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset: i32) -> u16 {
+    let line = row as i32 - offset;
     let mut c = col;
     let start_char = char_at(term, line, c, cols);
     if !start_char.map_or(false, is_word_char) {
@@ -342,8 +349,8 @@ fn word_boundary_left<T>(term: &Term<T>, row: u16, col: u16, cols: u16) -> u16 {
     c
 }
 
-fn word_boundary_right<T>(term: &Term<T>, row: u16, col: u16, cols: u16) -> u16 {
-    let line: i32 = row.into();
+fn word_boundary_right<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset: i32) -> u16 {
+    let line = row as i32 - offset;
     let mut c = col;
     let start_char = char_at(term, line, c, cols);
     if !start_char.map_or(false, is_word_char) {
@@ -542,5 +549,108 @@ mod tests {
         assert!(!is_word_char('\t'));
         assert!(!is_word_char('('));
         assert!(!is_word_char(','));
+    }
+
+    // --- Regression: extraction must follow `display_offset` ---
+    //
+    // The render path draws viewport row `r` from grid line
+    // `r - display_offset`, so a scrolled-up pane highlights scrollback
+    // content. Extraction used to index `Line(r)` directly — the active
+    // screen — making the copied text diverge from the highlight.
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    struct TestDims {
+        columns: usize,
+        screen_lines: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.screen_lines
+        }
+        fn screen_lines(&self) -> usize {
+            self.screen_lines
+        }
+        fn columns(&self) -> usize {
+            self.columns
+        }
+    }
+
+    /// Real alacritty `Term` fed `bytes`, then scrolled up `delta`
+    /// lines — mirrors the pane's wheel-scroll path
+    /// (`Session::scroll_lines` → `Term::scroll_display`).
+    fn scrolled_term(bytes: &[u8], cols: usize, rows: usize, delta: i32) -> Term<VoidListener> {
+        let dims = TestDims {
+            columns: cols,
+            screen_lines: rows,
+        };
+        let mut term = Term::new(TermConfig::default(), &dims, VoidListener);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, bytes);
+        term.scroll_display(Scroll::Delta(delta));
+        assert_eq!(term.grid().display_offset(), delta as usize);
+        term
+    }
+
+    #[test]
+    fn extract_reads_scrollback_line_under_highlight() {
+        // 6 lines in a 3-row terminal: active screen holds "3","4","5";
+        // scrolling up 2 puts "1","2","3" in the viewport.
+        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
+
+        let mut sel = SelectionState::default();
+        sel.begin(cell(0, 0), Instant::now());
+        sel.extend(cell(0, 0));
+
+        // Viewport row 0 shows "1", not grid Line(0) which holds "3".
+        assert_eq!(extract_text(&term, &sel).unwrap(), "1");
+    }
+
+    #[test]
+    fn extract_multiline_selection_respects_scrollback() {
+        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
+
+        let mut sel = SelectionState::default();
+        sel.begin(cell(0, 0), Instant::now());
+        sel.extend(cell(1, 0));
+
+        // Viewport rows 0..=1 show "1","2"; active-screen rows hold "3","4".
+        assert_eq!(extract_text(&term, &sel).unwrap(), "1\n2");
+    }
+
+    #[test]
+    fn line_mode_selection_reads_visible_line() {
+        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
+
+        let now = Instant::now();
+        let mut sel = SelectionState::default();
+        sel.begin(cell(2, 0), now);
+        sel.begin(cell(2, 0), now);
+        sel.begin(cell(2, 0), now); // triple-click → Line
+        assert_eq!(sel.granularity(), Granularity::Line);
+
+        // Viewport row 2 shows "3"; grid Line(2) holds "5".
+        assert_eq!(extract_text(&term, &sel).unwrap(), "3");
+    }
+
+    #[test]
+    fn word_snap_uses_visible_line() {
+        let term = scrolled_term(b"alpha beta\r\ngamma delta\r\n1\r\n2\r\n3", 20, 3, 2);
+
+        let now = Instant::now();
+        let mut sel = SelectionState::default();
+        sel.begin(cell(0, 2), now);
+        sel.begin(cell(0, 2), now); // double-click → Word
+        assert_eq!(sel.granularity(), Granularity::Word);
+
+        snap_to_word(&mut sel, &term);
+        let (start, end) = sel.char_range().unwrap();
+        assert_eq!((start.row, start.col), (0, 0));
+        assert_eq!((end.row, end.col), (0, 4));
+        assert_eq!(extract_text(&term, &sel).unwrap(), "alpha");
     }
 }
