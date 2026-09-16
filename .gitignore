@@ -19,6 +19,12 @@ Thumbs.db
 /rimeterm-*.log
 *.pid
 
+# Stray glab-tui theme/config dirs materialised into the CWD by the
+# upstream `$HOME`-less XDG fallback (`.`). These were historically
+# written into the repo root when launched from a checkout.
+/.config/
+**/.config/glab-tui/
+
 # Icon source (multi-res .ico is generated from this and shipped in-tree).
 /rimeterm-icon.png
 

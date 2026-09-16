@@ -465,22 +465,28 @@ const BUNDLED_THEMES: &[(&str, &str)] = &[
 ];
 
 fn config_dir() -> PathBuf {
+    // Test/embedding override: `GLAB_TUI_CONFIG` points at a concrete
+    // config.toml path whose parent dir is used as the config root, so
+    // tests can isolate every write inside a tempdir.
     if let Ok(path) = std::env::var("GLAB_TUI_CONFIG") {
         let mut p = PathBuf::from(path);
         p.pop();
         return p;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let xdg_config = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut p = PathBuf::from(&home);
-            p.push(".config");
-            p
-        });
-    let mut path = xdg_config;
-    path.push("glab-tui");
-    path
+    // Follow rimeterm's own state layout (C21.5) instead of upstream
+    // glab-tui's HOME/XDG_CONFIG_HOME resolution. Upstream falls back to
+    // `"."` when `HOME` is unset — which is the common case on Windows —
+    // and so materialises `.config/glab-tui/themes/` into the process CWD,
+    // i.e. the project directory rimeterm was launched from.
+    rimeterm_config::paths::home()
+        .map(|home| home.join("glab-tui"))
+        // Headless CI without a resolvable home dir: keep the state out of
+        // `~` but still namespaced, rather than a bare `.config` in CWD.
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("glab-tui")
+        })
 }
 
 fn themes_dir() -> PathBuf {
@@ -1710,26 +1716,28 @@ page_size = 250
     fn test_config_load_override() {
         let _guard = TEST_ENV_MUTEX.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
-        let conf_dir = temp_dir.path().join("glab-tui");
-        std::fs::create_dir_all(&conf_dir).unwrap();
         std::fs::write(
-            conf_dir.join("config.toml"),
+            temp_dir.path().join("config.toml"),
             "page_size = 250\napi_per_page = 20\n",
         )
         .unwrap();
 
-        let old_xdg = std::env::var("XDG_CONFIG_HOME");
+        // `GLAB_TUI_CONFIG` points at the concrete config.toml path; the
+        // parent dir becomes the config root (see `config_dir`). The old
+        // `XDG_CONFIG_HOME` override no longer has any effect after the
+        // config root was moved under `~/.rimeterm`.
+        let old = std::env::var("GLAB_TUI_CONFIG").ok();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+            std::env::set_var("GLAB_TUI_CONFIG", temp_dir.path().join("config.toml"));
         }
         let cfg = Config::load();
-        if let Ok(old) = old_xdg {
+        if let Some(old) = old {
             unsafe {
-                std::env::set_var("XDG_CONFIG_HOME", old);
+                std::env::set_var("GLAB_TUI_CONFIG", old);
             }
         } else {
             unsafe {
-                std::env::remove_var("XDG_CONFIG_HOME");
+                std::env::remove_var("GLAB_TUI_CONFIG");
             }
         }
         assert_eq!(cfg.page_size, 250);
