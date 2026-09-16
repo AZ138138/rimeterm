@@ -1010,7 +1010,7 @@ fn render_detail_overlay(
 }
 
 fn divider_line(width: u16) -> Line<'static> {
-    let bar: String = std::iter::repeat('─').take(width as usize).collect();
+    let bar: String = std::iter::repeat_n('─', width as usize).collect();
     Line::from(Span::styled(bar, Style::default().fg(Color::DarkGray)))
 }
 

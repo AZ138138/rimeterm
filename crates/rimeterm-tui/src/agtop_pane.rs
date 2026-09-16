@@ -1086,11 +1086,11 @@ fn detail_lines(agent: &AgentInfo, width: usize, out: &mut Vec<Line<'static>>) {
     }
 
     // Session id.
-    if let Some(id) = agent.session_id.as_deref() {
-        if !id.is_empty() {
-            let short: String = id.chars().take(24).collect();
-            out.push(field("session", &short));
-        }
+    if let Some(id) = agent.session_id.as_deref()
+        && !id.is_empty()
+    {
+        let short: String = id.chars().take(24).collect();
+        out.push(field("session", &short));
     }
 
     out.push(Line::from(""));

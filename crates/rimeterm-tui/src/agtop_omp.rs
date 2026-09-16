@@ -68,7 +68,7 @@ pub fn enrich_omp(live: &[LiveAgentRef<'_>], now_ms: u64) -> HashMap<u32, Sessio
     // running binary actually wrote.
     let mut encoded_to_pids: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
     for a in live {
-        if !OMP_LABELS.iter().any(|l| a.label == *l) {
+        if !OMP_LABELS.contains(&a.label) {
             continue;
         }
         for enc in encode_cwd_variants(a.cwd, &home) {
@@ -203,16 +203,14 @@ fn sessions_root() -> Option<PathBuf> {
     let agent_dir = env_path("OMP_CODING_AGENT_DIR")
         .unwrap_or_else(|| home_dir().unwrap_or_default().join(".omp").join("agent"));
     let settings = agent_dir.join("settings.json");
-    if let Ok(bytes) = fs::read(&settings) {
-        if let Ok(json) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(dir) = json
-                .get("sessionDir")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
-            {
-                return Some(expand_tilde(dir));
-            }
-        }
+    if let Ok(bytes) = fs::read(&settings)
+        && let Ok(json) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(dir) = json
+            .get("sessionDir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+    {
+        return Some(expand_tilde(dir));
     }
     Some(agent_dir.join("sessions"))
 }
@@ -239,10 +237,10 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("RIMETERM_HOME") {
-        if !v.is_empty() {
-            return Some(PathBuf::from(v));
-        }
+    if let Ok(v) = std::env::var("RIMETERM_HOME")
+        && !v.is_empty()
+    {
+        return Some(PathBuf::from(v));
     }
     rimeterm_config::paths::user_home_dir()
 }
@@ -382,29 +380,28 @@ fn analyse(records: &[Value]) -> AnalysisOut {
     let mut completed: HashMap<String, ()> = HashMap::new();
 
     for r in records {
-        if out.session_started_ms == 0 {
-            if let Some(ts) = r.get("timestamp").and_then(|v| v.as_str()) {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    out.session_started_ms = dt.timestamp_millis().max(0) as u64;
-                }
-            }
+        if out.session_started_ms == 0
+            && let Some(ts) = r.get("timestamp").and_then(|v| v.as_str())
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
+        {
+            out.session_started_ms = dt.timestamp_millis().max(0) as u64;
         }
-        if r.get("customType").and_then(|v| v.as_str()) == Some("tool_execution_start") {
-            if let Some(data) = r.get("data") {
-                out.current_tool = data
-                    .get("toolName")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                out.current_activity = data
-                    .get("intent")
-                    .and_then(|v| v.as_str())
-                    .map(normalize_activity)
-                    .filter(|s| !s.is_empty());
-                out.current_tool_id = data
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
+        if r.get("customType").and_then(|v| v.as_str()) == Some("tool_execution_start")
+            && let Some(data) = r.get("data")
+        {
+            out.current_tool = data
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            out.current_activity = data
+                .get("intent")
+                .and_then(|v| v.as_str())
+                .map(normalize_activity)
+                .filter(|s| !s.is_empty());
+            out.current_tool_id = data
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
 
         let msg = r.get("message");

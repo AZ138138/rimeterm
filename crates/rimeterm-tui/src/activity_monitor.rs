@@ -353,17 +353,16 @@ fn activity_from_value(value: Option<&Value>) -> Option<String> {
 pub(crate) fn parse_omp_activity(records: &[Value]) -> Option<ActivityState> {
     let mut current: Option<(String, ActivityState)> = None;
     for record in records {
-        if record.get("customType").and_then(Value::as_str) == Some("tool_execution_start") {
-            if let Some(data) = record.get("data")
-                && let (Some(id), Some(tool)) = (
-                    data.get("toolCallId").and_then(Value::as_str),
-                    data.get("toolName").and_then(Value::as_str),
-                )
-            {
-                let intent = activity_from_value(data.get("intent"));
-                if let Some(intent) = intent {
-                    current = Some((id.to_string(), ActivityState::new(tool, intent)));
-                }
+        if record.get("customType").and_then(Value::as_str) == Some("tool_execution_start")
+            && let Some(data) = record.get("data")
+            && let (Some(id), Some(tool)) = (
+                data.get("toolCallId").and_then(Value::as_str),
+                data.get("toolName").and_then(Value::as_str),
+            )
+        {
+            let intent = activity_from_value(data.get("intent"));
+            if let Some(intent) = intent {
+                current = Some((id.to_string(), ActivityState::new(tool, intent)));
             }
         }
         if let Some(message) = record.get("message") {

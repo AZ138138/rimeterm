@@ -567,12 +567,11 @@ fn analyse(records: &[Value]) -> AnalysisOut {
 
     for r in records {
         // First timestamp wins as session start.
-        if out.session_started_ms == 0 {
-            if let Some(ts) = r.get("timestamp").and_then(|v| v.as_str()) {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    out.session_started_ms = dt.timestamp_millis().max(0) as u64;
-                }
-            }
+        if out.session_started_ms == 0
+            && let Some(ts) = r.get("timestamp").and_then(|v| v.as_str())
+            && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
+        {
+            out.session_started_ms = dt.timestamp_millis().max(0) as u64;
         }
 
         // Stop reason (top-level and nested under `message`).
@@ -759,15 +758,12 @@ fn handle_tool_use(
             .get("input")
             .and_then(|i| i.get("todos"))
             .and_then(|v| v.as_array())
-        {
-            if let Some(in_prog) = todos
+            && let Some(in_prog) = todos
                 .iter()
                 .find(|t| t.get("status").and_then(|v| v.as_str()) == Some("in_progress"))
-            {
-                if let Some(t) = in_prog.get("content").and_then(|v| v.as_str()) {
-                    out.last_task = Some(t.to_string());
-                }
-            }
+            && let Some(t) = in_prog.get("content").and_then(|v| v.as_str())
+        {
+            out.last_task = Some(t.to_string());
         }
     } else if let Some(subj) = c
         .get("input")
@@ -860,10 +856,10 @@ fn home_dir() -> Option<PathBuf> {
     // tree via `RIMETERM_HOME`. Matches the escape hatch
     // `rimeterm-config::paths::home()` already offers for its own
     // dot-dir; we reuse the name so users don't need two env vars.
-    if let Ok(v) = std::env::var("RIMETERM_HOME") {
-        if !v.is_empty() {
-            return Some(PathBuf::from(v));
-        }
+    if let Ok(v) = std::env::var("RIMETERM_HOME")
+        && !v.is_empty()
+    {
+        return Some(PathBuf::from(v));
     }
     rimeterm_config::paths::user_home_dir()
 }

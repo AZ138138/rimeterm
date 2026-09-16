@@ -176,14 +176,12 @@ impl FileManagerPane {
                 path: next.cwd.clone(),
             });
         }
-        if highlight_changed {
-            if let Some(path) = next.highlighted {
-                bus.send(KernelEvent::FileSelected {
-                    origin: self.id,
-                    side: next.side,
-                    path,
-                });
-            }
+        if highlight_changed && let Some(path) = next.highlighted {
+            bus.send(KernelEvent::FileSelected {
+                origin: self.id,
+                side: next.side,
+                path,
+            });
         }
     }
 

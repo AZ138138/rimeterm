@@ -1519,7 +1519,7 @@ fn derive_mermaid_row_height(
     let display_px_h = (u64::from(raster.height) * u64::from(scale_num))
         .checked_div(u64::from(raster.width.max(1)))
         .unwrap_or(0);
-    let rows = ((display_px_h + u64::from(cell_h) - 1) / u64::from(cell_h)) as u16;
+    let rows = display_px_h.div_ceil(u64::from(cell_h)) as u16;
     rows.clamp(3, 40)
 }
 

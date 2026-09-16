@@ -240,12 +240,12 @@ async fn resolve_expected_digest(
     client: &reqwest::Client,
     installer: &WindowsInstaller,
 ) -> Result<String> {
-    if let Some(digest) = installer.msi.digest.as_deref() {
-        if let Some(hex) = digest.strip_prefix("sha256:") {
-            if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Ok(hex.to_ascii_lowercase());
-            }
-        }
+    if let Some(digest) = installer.msi.digest.as_deref()
+        && let Some(hex) = digest.strip_prefix("sha256:")
+        && hex.len() == 64
+        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(hex.to_ascii_lowercase());
     }
     let checksum_url = installer.checksums.browser_download_url.as_str();
     let response = fetch_asset_response(client, checksum_url, Some("text/plain, */*"))

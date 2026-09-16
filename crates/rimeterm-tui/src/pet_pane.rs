@@ -16,7 +16,6 @@ use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderO
 use rimeterm_pet::{
     actions, engine,
     persistence::{PetStore, StoreMode},
-    sprites,
 };
 
 const KEY_HINTS: &str = " f/m meal · s snack · d discipline · c clean · l light · i med · n hatch ";

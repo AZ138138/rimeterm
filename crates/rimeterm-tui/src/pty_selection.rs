@@ -336,7 +336,7 @@ fn word_boundary_left<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset: 
     let line = row as i32 - offset;
     let mut c = col;
     let start_char = char_at(term, line, c, cols);
-    if !start_char.map_or(false, is_word_char) {
+    if !start_char.is_some_and(is_word_char) {
         return c;
     }
     while c > 0 {
@@ -353,7 +353,7 @@ fn word_boundary_right<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset:
     let line = row as i32 - offset;
     let mut c = col;
     let start_char = char_at(term, line, c, cols);
-    if !start_char.map_or(false, is_word_char) {
+    if !start_char.is_some_and(is_word_char) {
         return c;
     }
     let last = cols.saturating_sub(1);

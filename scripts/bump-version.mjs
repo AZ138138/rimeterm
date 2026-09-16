@@ -53,6 +53,7 @@ const WORKSPACE_VERSIONED_CRATES = [
   "rimectl",
   "rimeterm-config",
   "rimeterm-core",
+  "rimeterm-game",
   "rimeterm-ipc",
   "rimeterm-markdown",
   "rimeterm-models",

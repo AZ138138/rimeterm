@@ -112,7 +112,7 @@ pub(crate) fn format_fetch_error(e: &FetchError) -> String {
         FetchError::Status { status, .. } => match *status {
             403 => "HTTP 403 — models.dev refused the request".to_owned(),
             429 => "HTTP 429 — models.dev rate-limited us".to_owned(),
-            502 | 503 | 504 => format!("HTTP {status} — models.dev is down"),
+            502..=504 => format!("HTTP {status} — models.dev is down"),
             other => format!("HTTP {other} from models.dev"),
         },
         FetchError::UnexpectedContent { preview } => {

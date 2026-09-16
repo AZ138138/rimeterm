@@ -315,7 +315,7 @@ impl Collector {
 fn enumerate_all_gpu_names() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        return windows_enumerate_gpus();
+        windows_enumerate_gpus()
     }
     #[cfg(target_os = "linux")]
     {
@@ -348,16 +348,15 @@ fn windows_enumerate_gpus() -> Vec<String> {
             "/format:list",
         ])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                let line = line.trim();
-                if let Some(name) = line.strip_prefix("Name=") {
-                    let name = name.trim();
-                    if !name.is_empty() {
-                        names.push(name.to_string());
-                    }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("Name=") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
                 }
             }
         }
@@ -374,14 +373,13 @@ fn windows_enumerate_gpus() -> Vec<String> {
             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
         ])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                let name = line.trim();
-                if !name.is_empty() {
-                    names.push(name.to_string());
-                }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let name = line.trim();
+            if !name.is_empty() {
+                names.push(name.to_string());
             }
         }
     }
