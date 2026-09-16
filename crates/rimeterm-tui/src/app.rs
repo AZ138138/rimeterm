@@ -1729,6 +1729,13 @@ impl App {
         // bar bottom-right. Network hiccups stay silent by design.
         self.spawn_startup_upgrade_check();
 
+        // Hide the OS caret while the diff is flushed. The blinking block
+        // cursor would otherwise visibly hop across every changed cell in
+        // other panes (status bar, sysmon, stock, spinners) on each frame,
+        // then snap back to the focused caret. Hiding it for the flush and
+        // letting `draw` re-show + re-position it at the very end keeps it
+        // pinned to the focused pane the whole time.
+        guard.terminal.hide_cursor()?;
         guard.terminal.draw(|f| {
             let cursor = self.draw(f.area(), f);
             if let Some((x, y)) = cursor {
@@ -1814,6 +1821,7 @@ impl App {
                 // Consume the pulse this frame is about to represent. Output
                 // arriving while draw runs remains queued for the next frame.
                 let _ = self.redraw_rx.try_recv();
+                guard.terminal.hide_cursor()?;
                 guard.terminal.draw(|f| {
                     let cursor = self.draw(f.area(), f);
                     if let Some((x, y)) = cursor {
