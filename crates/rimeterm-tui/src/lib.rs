@@ -18,6 +18,7 @@ pub mod app;
 pub mod diff_highlight;
 pub mod file_manager_pane;
 pub mod fr_pane;
+pub mod game_pane;
 pub mod git_model;
 pub mod git_pane;
 pub mod git_worker;

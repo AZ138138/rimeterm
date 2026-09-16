@@ -42,6 +42,7 @@ also be changed between landscape and vertical modes from the status bar.
 | **pet** | Persistent desktop pet linked to the first agent tab. Its state and activity reflect the main agent, including the current tool intent. | Feed, discipline, clean, toggle lights, give medicine, hatch, and observe agent activity. |
 | **models** | Browses the [models.dev](https://models.dev) model catalog. | Search, filter providers, sort models, and inspect context/cost details. |
 | **stock** | A-share, HK, and US quote watchlists via [akshare](https://github.com/Cricle/akshare-rs). | Search symbols, switch markets, refresh quotes, and open details. |
+| **game** | In-process terminal Pac-Man ported from [tui-game](https://github.com/MXFish/tui-game); high score persists globally. | Arrow keys move, `r` restart, `y`/`n` confirm. |
 | **zones** | Braille world map with day/night terminator and a user-curated timezone watchlist. | Add/delete zones, jump home, and inspect local times. |
 
 ### Right column

@@ -13,7 +13,7 @@ members = [
     "crates/rimeterm-models",
     "crates/rimeterm-stock",
     "crates/rimeterm-zones",
-    "crates/rimeterm-pet",
+    "crates/rimeterm-game",
     "crates/tuxedo",
     "crates/glab-tui",
 ]
@@ -38,6 +38,7 @@ rimeterm-models = { path = "crates/rimeterm-models", version = "0.2" }
 rimeterm-stock  = { path = "crates/rimeterm-stock",  version = "0.2" }
 rimeterm-zones  = { path = "crates/rimeterm-zones",  version = "0.2" }
 rimeterm-pet    = { path = "crates/rimeterm-pet",    version = "0.2" }
+rimeterm-game   = { path = "crates/rimeterm-game",   version = "0.2" }
 glab-tui        = { path = "crates/glab-tui" }
 tuxedo          = { path = "crates/tuxedo" }
 fast-resume      = { path = "crates/fast-resume" }

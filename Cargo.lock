@@ -5122,6 +5122,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rimeterm-game"
+version = "0.2.45"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "rimeterm-ipc"
 version = "0.2.45"
 dependencies = [
@@ -5239,6 +5246,7 @@ dependencies = [
  "reqwest",
  "rimeterm-config",
  "rimeterm-core",
+ "rimeterm-game",
  "rimeterm-ipc",
  "rimeterm-markdown",
  "rimeterm-models",

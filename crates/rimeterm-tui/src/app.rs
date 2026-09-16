@@ -464,13 +464,13 @@ pub(crate) fn classify_dispatch(
     active_root: &std::path::Path,
 ) -> DispatchGate {
     for project in projects {
-        if let Some(path) = map.get(project) {
-            if path.is_dir() {
-                return DispatchGate::Route {
-                    project: project.clone(),
-                    cwd: path.to_path_buf(),
-                };
-            }
+        if let Some(path) = map.get(project)
+            && path.is_dir()
+        {
+            return DispatchGate::Route {
+                project: project.clone(),
+                cwd: path.to_path_buf(),
+            };
         }
     }
     let ws_name = active_root
@@ -1467,6 +1467,14 @@ impl App {
         panes.insert(Box::new(pet));
         pinned_pane_ids.insert(pet_id);
         git_members.push(pet_id);
+
+        let game_best = rimeterm_config::paths::game_best_file()
+            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pacman-best.json"));
+        let game = crate::game_pane::GamePane::new(game_best);
+        let game_id = game.id();
+        panes.insert(Box::new(game));
+        pinned_pane_ids.insert(game_id);
+        git_members.push(game_id);
         panes.insert(Box::new(zones));
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
@@ -1516,6 +1524,7 @@ impl App {
                 git_pane_id,
             ),
             LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
+            LeftTabCatalogEntry::new("game", "Game", game_id),
             LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
             LeftTabCatalogEntry::new("pet", "Pet", pet_id),
@@ -2100,10 +2109,10 @@ impl App {
     fn close_viewer_overlay(&mut self) {
         let return_focus = self.viewer.close();
         let target = return_focus.or(self.file_manager_pane_id);
-        if let Some(id) = target {
-            if let Err(e) = self.focus_pane_by_id(id) {
-                warn!(error = %e, "close_viewer_overlay: return-focus failed");
-            }
+        if let Some(id) = target
+            && let Err(e) = self.focus_pane_by_id(id)
+        {
+            warn!(error = %e, "close_viewer_overlay: return-focus failed");
         }
         let _ = self.redraw_tx.send(());
     }
@@ -2369,11 +2378,11 @@ impl App {
                 let _ = self.redraw_tx.send(());
             }
             SettingsAction::ApplyGlabConfig(config) => {
-                if let Some(path) = rimeterm_config::glab_config::glab_config_file() {
-                    if let Err(error) = config.save_to(&path) {
-                        warn!(error = %error, "failed to persist glab config");
-                        self.set_hint(format!("glab config save failed: {error}"));
-                    }
+                if let Some(path) = rimeterm_config::glab_config::glab_config_file()
+                    && let Err(error) = config.save_to(&path)
+                {
+                    warn!(error = %error, "failed to persist glab config");
+                    self.set_hint(format!("glab config save failed: {error}"));
                 }
                 self.glab_config = config;
                 self.apply_glab_config_to_pane();
@@ -2400,15 +2409,13 @@ impl App {
             .iter()
             .find(|entry| entry.id == "glab")
             .map(|entry| entry.pane);
-        if let Some(id) = glab_id {
-            if let Some(pane) = self.panes.get_mut(id) {
-                if let Some(glab) = pane
-                    .as_any_mut()
-                    .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
-                {
-                    glab.set_config(self.glab_config.clone());
-                }
-            }
+        if let Some(id) = glab_id
+            && let Some(pane) = self.panes.get_mut(id)
+            && let Some(glab) = pane
+                .as_any_mut()
+                .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
+        {
+            glab.set_config(self.glab_config.clone());
         }
     }
 
@@ -2877,13 +2884,10 @@ impl App {
             }
         }
         if self.menu_state.open {
-            match menu_key(&mut self.menu_state, &self.menu, key) {
-                MenuKeyOutcome::Run(cmd) => {
-                    if let Err(e) = self.commands.run(cmd) {
-                        warn!(command = cmd, error = %e, "menu command failed");
-                    }
-                }
-                _ => {}
+            if let MenuKeyOutcome::Run(cmd) = menu_key(&mut self.menu_state, &self.menu, key)
+                && let Err(e) = self.commands.run(cmd)
+            {
+                warn!(command = cmd, error = %e, "menu command failed");
             }
             return;
         }
@@ -2907,13 +2911,10 @@ impl App {
         }
         if self.palette_state.open {
             let entries = self.command_entries();
-            match palette_key(&mut self.palette_state, &entries, key) {
-                PaletteOutcome::Run(cmd) => {
-                    if let Err(e) = self.commands.run(cmd) {
-                        warn!(command = cmd, error = %e, "palette command failed");
-                    }
-                }
-                _ => {}
+            if let PaletteOutcome::Run(cmd) = palette_key(&mut self.palette_state, &entries, key)
+                && let Err(e) = self.commands.run(cmd)
+            {
+                warn!(command = cmd, error = %e, "palette command failed");
             }
             return;
         }
@@ -2950,18 +2951,17 @@ impl App {
             use crossterm::event::{KeyCode, KeyModifiers};
             let plain_i = matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
                 && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT);
-            if plain_i {
-                if let Some(pane) = self.panes.get(id) {
-                    if let Some(cmd) = pane.install_command() {
-                        let cmd = cmd.to_string();
-                        self.set_hint(format!("⚙ opening install shell: {}", cmd));
-                        self.pending_mutations
-                            .lock()
-                            .push_back(PaneMutation::OpenShellAndType { command: cmd });
-                        let _ = self.redraw_tx.send(());
-                        return;
-                    }
-                }
+            if plain_i
+                && let Some(pane) = self.panes.get(id)
+                && let Some(cmd) = pane.install_command()
+            {
+                let cmd = cmd.to_string();
+                self.set_hint(format!("⚙ opening install shell: {}", cmd));
+                self.pending_mutations
+                    .lock()
+                    .push_back(PaneMutation::OpenShellAndType { command: cmd });
+                let _ = self.redraw_tx.send(());
+                return;
             }
             if let Some(pane) = self.panes.get_mut(id) {
                 let _ = pane.on_key(key);
@@ -3136,11 +3136,11 @@ impl App {
             }
             if self.ack_state.open {
                 // Click-outside closes; click-inside is swallowed.
-                if let Some(popup) = self.last_ack_popup_rect {
-                    if !point_in_rect(m.column, m.row, popup) {
-                        self.ack_state.close();
-                        let _ = self.redraw_tx.send(());
-                    }
+                if let Some(popup) = self.last_ack_popup_rect
+                    && !point_in_rect(m.column, m.row, popup)
+                {
+                    self.ack_state.close();
+                    let _ = self.redraw_tx.send(());
                 }
                 return;
             }
@@ -3167,26 +3167,26 @@ impl App {
         // drags inside the viewer itself (state.scrollbar_dragging()
         // is checked below as `sticky`, but LAYOUT drags need the same
         // stickiness in a dedicated slot at the App level).
-        if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
-            if self.active_drag.is_some() {
-                self.mouse_drag(m.column, m.row);
-                return;
-            }
+        if let MouseEventKind::Drag(MouseButton::Left) = m.kind
+            && self.active_drag.is_some()
+        {
+            self.mouse_drag(m.column, m.row);
+            return;
         }
-        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
-            if self.active_drag.take().is_some() {
-                // §19.12.6: on mouse-up the throttler is bypassed so the
-                // final drag size lands exactly on the PTY.
-                self.flush_pending_resizes();
-                // Clear the hover cache: the seam almost certainly moved
-                // under the cursor during the drag, so any pre-drag
-                // `hovered_divider` is stale. The very next `Moved`
-                // event will re-populate it with the current position.
-                if self.hovered_divider.take().is_some() {
-                    let _ = self.redraw_tx.send(());
-                }
-                return;
+        if let MouseEventKind::Up(MouseButton::Left) = m.kind
+            && self.active_drag.take().is_some()
+        {
+            // §19.12.6: on mouse-up the throttler is bypassed so the
+            // final drag size lands exactly on the PTY.
+            self.flush_pending_resizes();
+            // Clear the hover cache: the seam almost certainly moved
+            // under the cursor during the drag, so any pre-drag
+            // `hovered_divider` is stale. The very next `Moved`
+            // event will re-populate it with the current position.
+            if self.hovered_divider.take().is_some() {
+                let _ = self.redraw_tx.send(());
             }
+            return;
         }
 
         // --- Left Down on a divider strip → start layout drag (C22.6 fix) ---
@@ -3205,16 +3205,15 @@ impl App {
         //
         // Structural invariant: dividers own their strip regardless
         // of what a sibling widget renders underneath.
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            if let Some(d) = self
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind
+            && let Some(d) = self
                 .last_dividers
                 .iter()
                 .find(|d| point_in_rect(m.column, m.row, d.visual.rect))
                 .cloned()
-            {
-                self.start_divider_drag(d, m.column, m.row);
-                return;
-            }
+        {
+            self.start_divider_drag(d, m.column, m.row);
+            return;
         }
 
         // While the viewer overlay is open it owns mouse events that
@@ -3310,14 +3309,14 @@ impl App {
         // `pane_outer_at` returns `None` there and `open_context_menu`
         // stays reachable via the fall-through arm.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
-            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
-                if let Some(pane) = self.panes.get_mut(pane_id) {
-                    // Focus first so subsequent keyboard input targets
-                    // whatever the user right-clicked into — matches
-                    // the left-click flow (step 4 below).
-                    let _ = pane.on_mouse(m, outer_rect);
-                    return;
-                }
+            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row)
+                && let Some(pane) = self.panes.get_mut(pane_id)
+            {
+                // Focus first so subsequent keyboard input targets
+                // whatever the user right-clicked into — matches
+                // the left-click flow (step 4 below).
+                let _ = pane.on_mouse(m, outer_rect);
+                return;
             }
             // Divider / tab strip / empty gutter → structural menu.
             self.open_context_menu(m.column, m.row);
@@ -3347,14 +3346,14 @@ impl App {
             //    — the rects don't overlap. Handled before divider so
             //    a divider that somehow reaches row 0 (it doesn't) still
             //    yields to the more explicit hit.
-            if let Some(r) = self.last_status_bar_hits.menu {
-                if point_in_rect(m.column, m.row, r) {
-                    // Same signal `F10` / `Alt+M` use — `drain_flags`
-                    // picks it up next tick and toggles the menu state
-                    // through a single code path.
-                    self.flags.menu_toggle.store(true, Ordering::Relaxed);
-                    return;
-                }
+            if let Some(r) = self.last_status_bar_hits.menu
+                && point_in_rect(m.column, m.row, r)
+            {
+                // Same signal `F10` / `Alt+M` use — `drain_flags`
+                // picks it up next tick and toggles the menu state
+                // through a single code path.
+                self.flags.menu_toggle.store(true, Ordering::Relaxed);
+                return;
             }
             if self
                 .last_status_bar_hits
@@ -3372,13 +3371,13 @@ impl App {
                 self.set_layout_mode(WorkspaceLayoutMode::Vertical);
                 return;
             }
-            if let Some(r) = self.last_status_bar_hits.quit {
-                if point_in_rect(m.column, m.row, r) {
-                    // Same signal `Ctrl+Q` uses — the run loop polls
-                    // `flags.quit` and shuts down cleanly.
-                    self.flags.quit.store(true, Ordering::Relaxed);
-                    return;
-                }
+            if let Some(r) = self.last_status_bar_hits.quit
+                && point_in_rect(m.column, m.row, r)
+            {
+                // Same signal `Ctrl+Q` uses — the run loop polls
+                // `flags.quit` and shuts down cleanly.
+                self.flags.quit.store(true, Ordering::Relaxed);
+                return;
             }
             // Hint bar update chip. Lives in the bottom row rather
             // than the top status bar, but the same "widget belongs
@@ -3404,26 +3403,25 @@ impl App {
                 return;
             }
             // 2. Pane that wants mouse control (child owns the mouse).
-            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
-                if let Some(pane) = self.panes.get(pane_id) {
-                    if pane.wants_mouse_priority(
-                        m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
-                    ) {
-                        // Child wants the mouse — focus the clicked pane
-                        // first (so keyboard / cursor follow the click
-                        // even though the event itself is forwarded to
-                        // the child), then forward the Down event so the
-                        // child can handle its own interactions (yazi's
-                        // own dividers, vim click, etc). Drop the
-                        // immutable borrow before the mutable calls.
-                        let _ = pane;
-                        self.focus_pane_at(m.column, m.row);
-                        if let Some(pane_mut) = self.panes.get_mut(pane_id) {
-                            let _ = pane_mut.on_mouse(m, outer_rect);
-                        }
-                        return;
-                    }
+            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row)
+                && let Some(pane) = self.panes.get(pane_id)
+                && pane.wants_mouse_priority(
+                    m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
+                )
+            {
+                // Child wants the mouse — focus the clicked pane
+                // first (so keyboard / cursor follow the click
+                // even though the event itself is forwarded to
+                // the child), then forward the Down event so the
+                // child can handle its own interactions (yazi's
+                // own dividers, vim click, etc). Drop the
+                // immutable borrow before the mutable calls.
+                let _ = pane;
+                self.focus_pane_at(m.column, m.row);
+                if let Some(pane_mut) = self.panes.get_mut(pane_id) {
+                    let _ = pane_mut.on_mouse(m, outer_rect);
                 }
+                return;
             }
             // 3. Tab strip: activate / close / fire the group's `[+]`.
             if let Some(hit) = self.tab_hit(m.column, m.row) {
@@ -3438,25 +3436,24 @@ impl App {
             self.focus_pane_at(m.column, m.row);
         }
 
-        if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
-            if let Some(pane_id) = self.focus.focused_pane() {
-                let dragging = self
-                    .panes
-                    .get(pane_id)
-                    .is_some_and(|pane| pane.scrollbar_dragging());
-                if dragging {
-                    if let Some((_, outer_rect)) = self
-                        .last_pane_outer_rects
-                        .iter()
-                        .find(|(id, _)| *id == pane_id)
-                        .copied()
-                    {
-                        if let Some(pane) = self.panes.get_mut(pane_id) {
-                            let _ = pane.on_mouse(m, outer_rect);
-                        }
-                    }
-                    return;
+        if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+            && let Some(pane_id) = self.focus.focused_pane()
+        {
+            let dragging = self
+                .panes
+                .get(pane_id)
+                .is_some_and(|pane| pane.scrollbar_dragging());
+            if dragging {
+                if let Some((_, outer_rect)) = self
+                    .last_pane_outer_rects
+                    .iter()
+                    .find(|(id, _)| *id == pane_id)
+                    .copied()
+                    && let Some(pane) = self.panes.get_mut(pane_id)
+                {
+                    let _ = pane.on_mouse(m, outer_rect);
                 }
+                return;
             }
         }
 
@@ -3518,10 +3515,10 @@ impl App {
         // Convenience: clicking the "Pick an agent" placeholder pane also
         // opens the picker so users don't have to hunt for the `[+]`.
         // Cheap — one HashMap lookup + a string compare.
-        if let Some(pane) = self.panes.get(pane_id) {
-            if pane.title() == AGENT_PICKER_TITLE {
-                self.open_agent_picker();
-            }
+        if let Some(pane) = self.panes.get(pane_id)
+            && pane.title() == AGENT_PICKER_TITLE
+        {
+            self.open_agent_picker();
         }
     }
 
@@ -3565,10 +3562,10 @@ impl App {
                     });
                 }
             }
-            if let Some(plus) = hits.plus {
-                if point_in_rect(col, row, plus) {
-                    return Some(TabStripHit::Plus { gid: *gid });
-                }
+            if let Some(plus) = hits.plus
+                && point_in_rect(col, row, plus)
+            {
+                return Some(TabStripHit::Plus { gid: *gid });
             }
         }
         None
@@ -3894,7 +3891,7 @@ impl App {
             match self.new_agent_tab_in_cwd(BUILTIN_AGENTS, spec, cwd, Some(&project)) {
                 Ok(pane_id) => {
                     self.pending_spawn = Some(PendingSpawn {
-                        label: label.clone(),
+                        label,
                         pane_id,
                         started: Instant::now(),
                     });
@@ -4094,7 +4091,6 @@ impl App {
                 bounds,
             };
             self.picker_state.open_with_anchor(title, entries, anchor);
-            return;
         }
 
         // Pane-internal right-click intentionally has NO context menu
@@ -4691,10 +4687,10 @@ impl App {
                 self.set_hint(format!("⛔ {}", e));
             }
         }
-        if f.shells_close.swap(false, Ordering::Relaxed) {
-            if let Err(e) = self.close_current_shell_tab() {
-                self.set_hint(format!("⛔ {}", e));
-            }
+        if f.shells_close.swap(false, Ordering::Relaxed)
+            && let Err(e) = self.close_current_shell_tab()
+        {
+            self.set_hint(format!("⛔ {}", e));
         }
         if f.resize_toggle.swap(false, Ordering::Relaxed) {
             self.resize_mode = !self.resize_mode;
@@ -4719,10 +4715,8 @@ impl App {
         if f.viewer_open.swap(false, Ordering::Relaxed) {
             self.open_viewer_overlay();
         }
-        if f.viewer_close.swap(false, Ordering::Relaxed) {
-            if self.viewer.is_open() {
-                self.close_viewer_overlay();
-            }
+        if f.viewer_close.swap(false, Ordering::Relaxed) && self.viewer.is_open() {
+            self.close_viewer_overlay();
         }
         if f.viewer_open_with_system.swap(false, Ordering::Relaxed) {
             self.viewer_dispatch_external(ExternalAction::OpenWithSystem);
@@ -5335,11 +5329,11 @@ impl App {
     /// fallback text. `false` when either there's no hint or it's still
     /// fresh.
     fn expire_hint(&mut self) -> bool {
-        if let Some((_, t)) = &self.hint {
-            if t.elapsed() > Duration::from_secs(3) {
-                self.hint = None;
-                return true;
-            }
+        if let Some((_, t)) = &self.hint
+            && t.elapsed() > Duration::from_secs(3)
+        {
+            self.hint = None;
+            return true;
         }
         false
     }
@@ -5522,18 +5516,16 @@ impl App {
             // — `shutdown()` may not run in those paths.
             self.persist_session_state();
         }
-        if let Some(git_id) = self.git_pane_id {
-            if let Some(pane) = self.panes.get_mut(git_id) {
-                if let Some(git) = pane
-                    .as_any_mut()
-                    .and_then(|any| any.downcast_mut::<crate::git_pane::GitPane>())
-                {
-                    // Git already walks up on its own, but feeding it
-                    // the resolved root keeps its current_root in
-                    // step with what agents / status bar are showing.
-                    git.refresh_for(&resolved);
-                }
-            }
+        if let Some(git_id) = self.git_pane_id
+            && let Some(pane) = self.panes.get_mut(git_id)
+            && let Some(git) = pane
+                .as_any_mut()
+                .and_then(|any| any.downcast_mut::<crate::git_pane::GitPane>())
+        {
+            // Git already walks up on its own, but feeding it
+            // the resolved root keeps its current_root in
+            // step with what agents / status bar are showing.
+            git.refresh_for(&resolved);
         }
         if workspace_changed
             && let Some(glab_id) = self.catalog_pane_id("glab")
@@ -6009,10 +6001,9 @@ impl App {
                         .iter()
                         .find(|(p, _)| p == &path)
                         .map(|(_, r)| r.clone())
+                        && self.tree.set_ratios(&path, defaults).is_ok()
                     {
-                        if self.tree.set_ratios(&path, defaults).is_ok() {
-                            touched += 1;
-                        }
+                        touched += 1;
                     }
                 }
                 // Rewrite the state file (not delete!) so overrides on
@@ -6712,10 +6703,10 @@ fn register_commands(
         register(
             cmds,
             Command::signal(
-                *id,
+                id,
                 title,
                 Some("Alt+Shift+<N>"),
-                Arc::new(move || f.tab_goto.store((i + 1) as usize, Ordering::Relaxed)),
+                Arc::new(move || f.tab_goto.store(i + 1, Ordering::Relaxed)),
             ),
         )?;
     }
@@ -6747,13 +6738,10 @@ fn register_commands(
         register(
             cmds,
             Command::signal(
-                *id,
+                id,
                 title,
                 Some("Alt+<N>"),
-                Arc::new(move || {
-                    f.focus_quadrant
-                        .store((idx + 1) as usize, Ordering::Relaxed)
-                }),
+                Arc::new(move || f.focus_quadrant.store(idx + 1, Ordering::Relaxed)),
             ),
         )?;
     }
@@ -6761,7 +6749,7 @@ fn register_commands(
     // Live-state reporter: reads the shared WorkspaceSnapshot (refreshed each
     // frame) and returns it as JSON. Ignores args.
     {
-        let snap = snapshot.clone();
+        let snap = snapshot;
         let cmd = Command {
             id: "workspace.snapshot",
             title: "Snapshot workspace state",
@@ -6778,7 +6766,7 @@ fn register_commands(
     // atomic-flag pipeline so palette / keymap / rimectl land on the same
     // path. Wraps the value into flags.tab_goto (1..=9).
     {
-        let f = flags.clone();
+        let f = flags;
         let cmd = Command {
             id: "workspace.tab.goto",
             title: "Go to tab N in focused group",
@@ -6889,7 +6877,7 @@ fn register_commands(
     //          poll_ms?: u64 in [25,1000]}
     //   → {pane_id, matched: bool, rows_captured, contents, elapsed_ms}
     {
-        let sw = session_writes.clone();
+        let sw = session_writes;
         let cmd = Command {
             id: "workspace.pane.wait",
             title: "Wait until a regex matches a pane's output",
@@ -7561,7 +7549,7 @@ pub(crate) fn run_tool_action(
             argv.push("install".into());
             argv.push("--locked".into());
             argv.push("--root".into());
-            argv.push(root_flag.clone());
+            argv.push(root_flag);
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -7572,7 +7560,7 @@ pub(crate) fn run_tool_action(
             argv.push("--locked".into());
             argv.push("--force".into());
             argv.push("--root".into());
-            argv.push(root_flag.clone());
+            argv.push(root_flag);
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -7581,7 +7569,7 @@ pub(crate) fn run_tool_action(
         ToolAction::Uninstall => {
             argv.push("uninstall".into());
             argv.push("--root".into());
-            argv.push(root_flag.clone());
+            argv.push(root_flag);
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -8137,16 +8125,14 @@ fn ratios_equal_approx(a: &[f32], b: &[f32]) -> bool {
 fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
     let mut max = 0usize;
     for id in members {
-        if let Some(pane) = panes.get(*id) {
-            if let Some(n) = pane
+        if let Some(pane) = panes.get(*id)
+            && let Some(n) = pane
                 .title()
                 .strip_prefix("shell-")
                 .and_then(|s| s.parse::<usize>().ok())
-            {
-                if n > max {
-                    max = n;
-                }
-            }
+            && n > max
+        {
+            max = n;
         }
     }
     max + 1
