@@ -222,12 +222,12 @@ impl PtyPane {
         let Some(text) = text else {
             return;
         };
-        // arboard::Clipboard::new() opens / closes the OS handle each
+        // crate::clipboard::Clipboard::new() opens / closes the OS handle each
         // call. That's the recommended usage — long-lived handles can
         // leak on X11 when the process exits without a proper
         // disconnect — and cost is a low-microsecond thing off the hot
         // path.
-        if let Ok(mut clip) = arboard::Clipboard::new() {
+        if let Ok(mut clip) = crate::clipboard::Clipboard::new() {
             let _ = clip.set_text(text);
         }
     }
@@ -236,7 +236,7 @@ impl PtyPane {
     /// child asked for them (DECSET 2004), and write to the PTY.
     /// Silent no-op on empty clipboard or clipboard error.
     fn paste_from_clipboard(&mut self) {
-        let Ok(mut clip) = arboard::Clipboard::new() else {
+        let Ok(mut clip) = crate::clipboard::Clipboard::new() else {
             return;
         };
         let Ok(text) = clip.get_text() else {

@@ -1,5 +1,5 @@
+use crate::clipboard::Clipboard;
 use anyhow::Result;
-use arboard::Clipboard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::adapters::adapter_for;

@@ -538,7 +538,7 @@ impl SettingsState {
                 None
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Ok(mut clipboard) = arboard::Clipboard::new()
+                if let Ok(mut clipboard) = crate::clipboard::Clipboard::new()
                     && let Ok(text) = clipboard.get_text()
                 {
                     let clean = text.lines().next().unwrap_or("").trim();

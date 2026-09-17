@@ -953,7 +953,7 @@ impl ViewerOverlayState {
         if out.trim().is_empty() {
             return;
         }
-        if let Ok(mut clip) = arboard::Clipboard::new() {
+        if let Ok(mut clip) = crate::clipboard::Clipboard::new() {
             let _ = clip.set_text(out);
         }
     }

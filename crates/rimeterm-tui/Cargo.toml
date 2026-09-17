@@ -33,7 +33,6 @@ chrono = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 which = { workspace = true }
 unicode-width = { workspace = true }
-arboard = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 semver = "1"
@@ -86,6 +85,11 @@ glab-tui = { workspace = true }
 # `#[cfg(target_os = "linux")]` for the same reason.
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }
+
+# `arboard` has no Android backend and does not compile on `target_os =
+# "android"`; src/clipboard.rs provides a no-op shim there instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { workspace = true }
 
 
 [dev-dependencies]
