@@ -1729,19 +1729,21 @@ impl App {
         // bar bottom-right. Network hiccups stay silent by design.
         self.spawn_startup_upgrade_check();
 
-        // Hide the OS caret while the diff is flushed. The blinking block
-        // cursor would otherwise visibly hop across every changed cell in
-        // other panes (status bar, sysmon, stock, spinners) on each frame,
-        // then snap back to the focused caret. Hiding it for the flush and
-        // letting `draw` re-show + re-position it at the very end keeps it
-        // pinned to the focused pane the whole time.
+        // Keep the OS caret hidden across the diff flush, then re-position it
+        // (still hidden) and only reveal it at the very end. If `draw` re-shows
+        // the caret via `set_cursor_position` it first appears on the last
+        // changed cell (status bar, sysmon, stock, spinners) and then jumps to
+        // the focused caret — the visible "cursor hop". Positioning before
+        // `show_cursor` pins the caret to the focused pane for the whole frame.
         guard.terminal.hide_cursor()?;
+        let mut cursor = None;
         guard.terminal.draw(|f| {
-            let cursor = self.draw(f.area(), f);
-            if let Some((x, y)) = cursor {
-                f.set_cursor_position((x, y));
-            }
+            cursor = self.draw(f.area(), f);
         })?;
+        if let Some((x, y)) = cursor {
+            guard.terminal.set_cursor_position((x, y))?;
+            guard.terminal.show_cursor()?;
+        }
         self.needs_redraw = false;
         let mut last_draw = Instant::now();
 
@@ -1822,12 +1824,14 @@ impl App {
                 // arriving while draw runs remains queued for the next frame.
                 let _ = self.redraw_rx.try_recv();
                 guard.terminal.hide_cursor()?;
+                let mut cursor = None;
                 guard.terminal.draw(|f| {
-                    let cursor = self.draw(f.area(), f);
-                    if let Some((x, y)) = cursor {
-                        f.set_cursor_position((x, y));
-                    }
+                    cursor = self.draw(f.area(), f);
                 })?;
+                if let Some((x, y)) = cursor {
+                    guard.terminal.set_cursor_position((x, y))?;
+                    guard.terminal.show_cursor()?;
+                }
                 self.needs_redraw = false;
                 last_draw = now;
             }
