@@ -190,8 +190,8 @@ jobs:
       # zigbuild writes to the usual target/<triple>/release/ directory
       # (no glibc-suffix), so `cargo deb --no-build --target` below is
       # unchanged. Versions pinned to the combo validated for v0.2.44.
-      - name: Install cargo-zigbuild + zig (Linux + Android)
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-linux-android'
+      - name: Install cargo-zigbuild + zig (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           pip3 install --user ziglang==0.16.0
           python3 -m ziglang version
@@ -218,12 +218,29 @@ jobs:
             exit 1
           fi
 
-      # Android/Termux: zig acts as the cross linker against Bionic —
-      # no NDK needed. The result targets Termux on aarch64 devices
-      # (one-line install: scripts/install-termux.sh).
-      - name: Cargo zigbuild --release, android (Termux)
+      # Android/Termux: cross-compile against Bionic with the NDK via
+      # cargo-ndk — the canonical Rust-on-Android path (zig cc lacks the
+      # Bionic headers ring needs). The result targets Termux on aarch64
+      # devices (one-line install: scripts/install-termux.sh).
+      - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android'
-        run: cargo zigbuild --release --workspace --bins --target aarch64-linux-android
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip" -O "$RUNNER_TEMP/ndk.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME/ndk"
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk (Android)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Cargo ndk build --release, android (Termux)
+        if: matrix.target == 'aarch64-linux-android'
+        # --platform 24: Termux itself requires Android 7.0 (API 24), and
+        # Bionic only exports openpty (23) / getifaddrs (24) from those
+        # levels up — the default 21 stubs don't have them.
+        run: cargo ndk --platform 24 -t aarch64-linux-android build --release --workspace --bins
 
       # C25: essentials fetch retired. Files, git, and sysmon are all
       # Native panes now — zero external binaries ship with rimeterm.
