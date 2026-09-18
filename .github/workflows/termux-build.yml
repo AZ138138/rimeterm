@@ -1,0 +1,78 @@
+# Cross-compile rimeterm for Android/Termux (aarch64) on every PR that
+# touches buildable code, and on demand. Uses the Android NDK via
+# cargo-ndk — the canonical way to build Rust for Bionic — producing
+# binaries that run under Termux on aarch64 devices.
+name: Termux build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/termux-build.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'scripts/install-termux.sh'
+
+# Cancel superseded runs from the same ref (rebase-heavy PRs).
+concurrency:
+  group: termux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: r27c
+
+jobs:
+  termux-aarch64:
+    name: Build · Termux aarch64
+    # x86_64 host: Google ships the Linux NDK for x86_64 only. The host
+    # architecture doesn't affect the artifact — it's cross-compiled to
+    # aarch64-android either way.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK (${{ env.NDK_VERSION }})
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" -O "$RUNNER_TEMP/ndk.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME/ndk"
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Add rust target (aarch64-linux-android)
+        run: rustup target add aarch64-linux-android
+
+      - name: Cargo ndk build --release (aarch64-linux-android)
+        # --platform 24: Termux itself requires Android 7.0 (API 24), and
+        # Bionic only exports openpty (23) / getifaddrs (24) from those
+        # levels up — the default 21 stubs don't have them.
+        run: cargo ndk --platform 24 -t aarch64-linux-android build --release --workspace --bins
+
+      # Guard the artifact shape: Bionic-linked PIE (Android rejects
+      # non-PIE executables, and glibc-linked ones wouldn't load under
+      # Termux at all).
+      - name: Inspect binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          file target/aarch64-linux-android/release/rimeterm
+          file target/aarch64-linux-android/release/rimectl
+          NEEDED="$(readelf -d target/aarch64-linux-android/release/rimeterm | grep NEEDED)"
+          echo "$NEEDED"
+          echo "$NEEDED" | grep -q '\[libc\.so\]' || {
+            echo "::error::rimeterm is not linked against Bionic (libc.so) — the artifact would not run under Termux"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rimeterm-termux-aarch64-${{ github.sha }}
+          path: |
+            target/aarch64-linux-android/release/rimeterm
+            target/aarch64-linux-android/release/rimectl
+          if-no-files-found: error
+          retention-days: 14
