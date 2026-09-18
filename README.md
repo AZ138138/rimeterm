@@ -123,7 +123,14 @@ Then run `rimeterm` from any terminal.
 
 ### Android / Termux
 
-rimeterm builds and runs on Android via [Termux](https://termux.dev) (aarch64):
+One-line install (aarch64 Termux):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/caozisheng/rimeterm/main/scripts/install-termux.sh | sh
+```
+
+Downloads the prebuilt `rimeterm` + `rimectl` from the latest release
+(cross-compiled against Bionic on CI). Or build from source:
 
 ```bash
 pkg install rust clang
