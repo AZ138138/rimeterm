@@ -1,4 +1,4 @@
-# Release builds — produce native installers for all three OSes.
+# Release builds — produce native installers for the supported platforms.
 #
 # Trigger:
 #   * push of a tag matching `v*` (e.g. `v0.1.0`, `v0.2.0-rc.1`) creates a
@@ -7,7 +7,8 @@
 #     Release (uploaded as run artefacts only), useful for testing the
 #     packaging pipeline itself.
 #
-# One installer per OS — no raw tarball/zip ships. Payload inside each:
+# One installer per OS (Android ships a plain tarball — Termux has no
+# system package GUI). Payload inside each:
 #   * `rimeterm` (+ `.exe` on Windows; icon embedded via winresource)
 #   * `rimectl`
 #   * `LICENSE`, `README.md`, `ACKNOWLEDGEMENTS.md`
@@ -26,6 +27,10 @@
 #                 hdiutil UDZO drag-to-install disk image (Apple Silicon
 #                 only). Unsigned — Gatekeeper right-click Open on first
 #                 launch.
+#   * Android → `rimeterm-<version>-termux-aarch64.tar.gz`
+#                 cross-compiled against Bionic with cargo-zigbuild (no
+#                 NDK needed). For Termux on aarch64 devices — install
+#                 with scripts/install-termux.sh.
 #
 # On tag pushes `<version>` == the tag minus the leading `v`; on manual
 # dispatch it's the short commit SHA so pre-release artefacts are traceable.
@@ -73,6 +78,9 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             shared-key: release-windows
+          - target: aarch64-linux-android
+            os: ubuntu-latest           # x86_64 host — zig cross-compiles
+            shared-key: release-android
 
     steps:
       - uses: actions/checkout@v4
@@ -172,7 +180,7 @@ jobs:
       # One cargo invocation so incremental linking + parallel codegen share
       # work across both binaries (macOS / Windows).
       - name: Cargo build --release (rimeterm + rimectl)
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        if: matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'aarch64-linux-android'
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
       # Linux: link against an older glibc with cargo-zigbuild so the .deb
@@ -209,6 +217,30 @@ jobs:
             echo "::error::glibc baseline regressed (${MAX_GLIBC} > 2.31) - the .deb would no longer install on Ubuntu 20.04/WSL"
             exit 1
           fi
+
+      # Android/Termux: cross-compile against Bionic with the NDK via
+      # cargo-ndk — the canonical Rust-on-Android path (zig cc lacks the
+      # Bionic headers ring needs). The result targets Termux on aarch64
+      # devices (one-line install: scripts/install-termux.sh).
+      - name: Install Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip" -O "$RUNNER_TEMP/ndk.zip"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$HOME/ndk"
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk (Android)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Cargo ndk build --release, android (Termux)
+        if: matrix.target == 'aarch64-linux-android'
+        # --platform 24: Termux itself requires Android 7.0 (API 24), and
+        # Bionic only exports openpty (23) / getifaddrs (24) from those
+        # levels up — the default 21 stubs don't have them.
+        run: cargo ndk --platform 24 -t aarch64-linux-android build --release --workspace --bins
 
       # C25: essentials fetch retired. Files, git, and sysmon are all
       # Native panes now — zero external binaries ship with rimeterm.
@@ -348,6 +380,25 @@ jobs:
           ls -la "$OUT"
           echo "path=$OUT" >> "$GITHUB_OUTPUT"
 
+      # Android/Termux ships as a plain tarball: Termux has no system
+      # package GUI, so users untar into $PREFIX — scripts/install-termux.sh
+      # automates that (one-liner), or they run the commands by hand.
+      - name: Package tarball (Android / Termux)
+        if: matrix.target == 'aarch64-linux-android'
+        id: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="rimeterm-${{ steps.version.outputs.value }}-termux-aarch64"
+          mkdir -p "$DIR"
+          cp "target/aarch64-linux-android/release/rimeterm" "$DIR/"
+          cp "target/aarch64-linux-android/release/rimectl"  "$DIR/"
+          cp README.md LICENSE ACKNOWLEDGEMENTS.md "$DIR/"
+          OUT="rimeterm-${{ steps.version.outputs.value }}-termux-aarch64.tar.gz"
+          tar czf "$OUT" "$DIR"
+          ls -la "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
       - name: Resolve installer path
         id: installer
         shell: bash
@@ -362,6 +413,8 @@ jobs:
             echo "path=${{ steps.deb.outputs.path }}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             echo "path=${{ steps.dmg.outputs.path }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+            echo "path=${{ steps.android.outputs.path }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload installer artefact
