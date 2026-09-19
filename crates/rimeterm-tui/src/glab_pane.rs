@@ -121,7 +121,7 @@ impl GlabPane {
     fn handle_host_action(&mut self, action: HostAction) {
         match action {
             HostAction::CopyText(text) => {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(mut clipboard) = crate::clipboard::Clipboard::new() {
                     let _ = clipboard.set_text(text);
                 }
                 self.app

@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-arboard = "3.4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29"
@@ -29,6 +28,11 @@ tantivy = "0.26.1"
 unicode-width = "0.2"
 url = "2.5"
 walkdir = "2.5"
+
+# `arboard` has no Android backend and does not compile on `target_os =
+# "android"`; src/clipboard.rs provides a no-op shim there instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3.4"
 
 [dev-dependencies]
 chrono-tz = "0.10"

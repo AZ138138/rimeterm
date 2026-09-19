@@ -15,6 +15,7 @@ pub mod agtop_pricing;
 pub mod agtop_session;
 pub mod agtop_worker;
 pub mod app;
+pub mod clipboard;
 pub mod diff_highlight;
 pub mod file_manager_pane;
 pub mod fr_pane;

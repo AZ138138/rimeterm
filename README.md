@@ -121,6 +121,22 @@ cargo install --path crates/rimectl  --bin rimectl  --locked
 
 Then run `rimeterm` from any terminal.
 
+### Android / Termux
+
+rimeterm builds and runs on Android via [Termux](https://termux.dev) (aarch64):
+
+```bash
+pkg install rust clang
+git clone https://github.com/caozisheng/rimeterm
+cd rimeterm
+cargo build --release --workspace --bins
+cp target/release/rimeterm target/release/rimectl "$PREFIX/bin/"
+```
+
+Clipboard operations are unavailable on Android: `arboard` has no Android
+backend, so it is only compiled for non-Android targets and the Android build
+uses a no-op `clipboard` shim instead.
+
 ## More
 
 - Third-party attributions: [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md)
