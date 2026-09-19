@@ -3451,11 +3451,11 @@ impl App {
         if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
             && let Some(pane_id) = self.focus.focused_pane()
         {
-            let dragging = self
+            let sticky = self
                 .panes
                 .get(pane_id)
-                .is_some_and(|pane| pane.scrollbar_dragging());
-            if dragging {
+                .is_some_and(|pane| pane.scrollbar_dragging() || pane.text_selection_dragging());
+            if sticky {
                 if let Some((_, outer_rect)) = self
                     .last_pane_outer_rects
                     .iter()

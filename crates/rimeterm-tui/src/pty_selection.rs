@@ -1,57 +1,37 @@
-//! Local mouse selection + system clipboard for [`PtyPane`].
+//! Local mouse selection + system clipboard state.
 //!
 //! C22.6: rimeterm can own the mouse for text selection when the child
-//! program hasn't asked for xterm mouse reports. Selection state lives
-//! per-pane so each PTY tab keeps its own highlight.
+//! program hasn't asked for xterm mouse reports.
 //!
-//! The heavy lifting is here so `pty_pane.rs` stays focused on the
-//! grid-to-buffer paint path and PTY plumbing.
+//! Two consumers with different needs:
 //!
-//! ## Coordinate system
-//!
-//! All rows/cols are **inner-content, 0-based**: `(0, 0)` is the top-left
-//! visible cell after subtracting the pane border. Scrollback is out of
-//! scope for v1 — selection only spans the currently-visible viewport.
-//!
-//! ## Life cycle
-//!
-//! 1. `Down(Left)` → [`SelectionState::begin`] anchors at `(row, col)`.
-//!    A repeat click at the same spot within
-//!    [`MULTI_CLICK_MS`] promotes to [`Granularity::Word`] then
-//!    [`Granularity::Line`] (xterm behaviour).
-//! 2. `Drag(Left)` → [`SelectionState::extend`] moves the cursor.
-//! 3. `Up(Left)` → [`SelectionState::commit`] freezes the range and
-//!    returns the extracted text so the caller can push it to arboard.
-//! 4. A fresh `Down(Left)` on empty space or a new anchor resets the
-//!    state.
+//! - [`PtyPane`](crate::pty_pane::PtyPane) stores its selection inside
+//!   alacritty's `Term.selection` in **absolute grid coordinates**
+//!   (`alacritty_terminal::index::Point`). When the child streams new
+//!   output, `Term::scroll_up` rotates the selection along with the
+//!   content, so the highlight always sticks to the same text — even
+//!   across scrollback — exactly like alacritty itself. PtyPane keeps
+//!   only the small UI-side state machine here: [`ClickStreak`] for
+//!   double/triple-click granularity promotion, plus which anchor the
+//!   drag is extending.
+//! - The read-only file viewer overlays render into a ratatui `Buffer`
+//!   and have no grid, so they keep the original viewport-relative
+//!   [`SelectionState`].
 //!
 //! `Shift+Left` inside `Down` extends the existing selection instead of
 //! starting a new one (Alacritty / xterm convention).
 
 use std::time::Instant;
 
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::Term;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::index::Point;
 
 /// Maximum gap between clicks for double-/triple-click detection. 400 ms
 /// matches xterm's default and Windows' `GetDoubleClickTime` median.
 const MULTI_CLICK_MS: u128 = 400;
 
-/// Word-boundary character class. A "word" is a run of non-whitespace
-/// non-punctuation characters — this lets double-click grab
-/// `foo.rs`, `crates/rimeterm-tui`, or `192.168.0.1` in one shot,
-/// matching what tmux / Windows Terminal / iTerm2 all do.
-fn is_word_char(c: char) -> bool {
-    !c.is_whitespace()
-        && !matches!(
-            c,
-            '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '"' | '\''
-        )
-}
-
-/// Selection granularity, promoted on double- / triple-click.
+/// Which granularity a drag selects with, promoted on double- /
+/// triple-click. Maps 1:1 onto alacritty's `SelectionType`
+/// (Char→Simple, Word→Semantic, Line→Lines).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Granularity {
     #[default]
@@ -60,9 +40,62 @@ pub enum Granularity {
     Line,
 }
 
-/// Per-pane selection state. Empty (`None` anchor) means "no active
-/// selection"; a non-empty state means the highlight is either being
-/// dragged (still tracking mouse) or frozen after `commit`.
+/// PTY-side click state: streak counting + granularity promotion for a
+/// selection anchored in `Term.selection`.
+///
+/// All coordinates are **absolute grid points** (`Point` = line +
+/// column in alacritty's storage space), so a click streak survives
+/// streaming output and viewport scrolling without re-anchoring.
+#[derive(Clone, Debug, Default)]
+pub struct ClickStreak {
+    /// Timestamp + cell of the most recent `Down`, used to detect
+    /// double/triple-click. Absolute grid point.
+    last_click: Option<(Instant, Point)>,
+    /// Click streak: 1 = char, 2 = word, 3 = line, wrapping back to 1.
+    click_streak: u8,
+}
+
+impl ClickStreak {
+    /// Register a fresh `Down` at absolute grid point `at`. If the click
+    /// lands on the same point within [`MULTI_CLICK_MS`] of the previous
+    /// one, the granularity promotes: 1 → 2 (word) → 3 (line) → back
+    /// to 1 (char). `now` is passed in so unit tests can drive
+    /// multi-click without racing wall-clock.
+    pub fn begin(&mut self, at: Point, now: Instant) -> Granularity {
+        let streak = match self.last_click {
+            Some((t, point))
+                if point == at && now.duration_since(t).as_millis() < MULTI_CLICK_MS =>
+            {
+                (self.click_streak % 3) + 1
+            }
+            _ => 1,
+        };
+        self.click_streak = streak;
+        self.last_click = Some((now, at));
+        match streak {
+            2 => Granularity::Word,
+            3 => Granularity::Line,
+            _ => Granularity::Char,
+        }
+    }
+
+    /// A click at a different point always restarts the streak — call
+    /// before `begin` decides promotion. (Kept for symmetry; `begin`
+    /// already requires point equality for promotion.)
+    pub fn reset(&mut self) {
+        self.click_streak = 0;
+        self.last_click = None;
+    }
+}
+
+/// Per-pane selection state for buffer-rendering surfaces (the file
+/// viewer overlays). Empty (`None` anchor) means "no active selection";
+/// a non-empty state means the highlight is either being dragged (still
+/// tracking mouse) or frozen after `commit`.
+///
+/// PTY panes do NOT use this — they anchor inside `Term.selection`
+/// (see module docs). Kept because viewer overlays render into ratatui
+/// buffers with no grid to anchor against.
 #[derive(Clone, Debug, Default)]
 pub struct SelectionState {
     /// The stationary end of the selection (grabbed on `Down`).
@@ -219,171 +252,111 @@ impl SelectionState {
     }
 }
 
-/// Extract the plaintext content of the current selection out of
-/// `term`'s visible grid.
-///
-/// Returns `None` for an empty or trivially-empty selection. The
-/// caller pushes the string to arboard.
-///
-/// ### Wrap handling
-///
-/// Alacritty marks a cell with [`Flags::WRAPLINE`] when its row
-/// continued into the next row *because the parser wrapped*, not
-/// because the user pressed Enter. We use it to *not* insert a `\n`
-/// between such rows so pasting long shell lines round-trips
-/// correctly. Real newlines land at row boundaries whose LAST
-/// non-blank cell lacks the flag.
-///
-/// ### Wide chars
-///
-/// A wide char occupies two grid columns; the trailing cell has
-/// [`Flags::WIDE_CHAR_SPACER`]. We skip spacers so we never emit the
-/// grapheme twice.
-pub fn extract_text<T>(term: &Term<T>, sel: &SelectionState) -> Option<String> {
-    let (start, end) = sel.char_range()?;
-    let cols = term.grid().columns() as u16;
-    // Viewport row `r` displays grid line `r - display_offset` (the
-    // render path's `display_iter` starts at `Line(-display_offset)`).
-    // Scrollback panes have offset > 0, so every grid lookup below must
-    // go through the same conversion or the copied text diverges from
-    // the highlight.
-    let offset = term.grid().display_offset() as i32;
-    let mut out = String::new();
-
-    for row in start.row..=end.row {
-        let (row_start, row_end) = row_bounds(sel, row, start, end, cols);
-        let line_wrapped = row_is_wrapped(term, row, cols, offset);
-        let mut row_str = String::new();
-        let line = row as i32 - offset;
-
-        for col in row_start..=row_end {
-            let point = Point::new(Line(line), Column(col as usize));
-            let cell = &term.grid()[point];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-            row_str.push(if cell.c == '\0' { ' ' } else { cell.c });
-        }
-
-        // Trim trailing spaces on non-wrapped rows so a selection of
-        // three short shell prompts doesn't come out padded to full
-        // width. Wrapped rows keep their spaces — they're mid-token.
-        if !line_wrapped {
-            let trimmed_end = row_str.trim_end();
-            row_str.truncate(trimmed_end.len());
-        }
-        out.push_str(&row_str);
-        if row < end.row && !line_wrapped {
-            out.push('\n');
-        }
-    }
-
-    if out.is_empty() { None } else { Some(out) }
-}
-
-/// Per-row `(start_col, end_col)` clamped to `cols - 1`, respecting
-/// granularity.
-fn row_bounds(sel: &SelectionState, row: u16, start: Cell, end: Cell, cols: u16) -> (u16, u16) {
-    let max_col = cols.saturating_sub(1);
-    match sel.mode {
-        Granularity::Line => (0, max_col),
-        Granularity::Char | Granularity::Word => {
-            let s = if row == start.row { start.col } else { 0 };
-            let e = if row == end.row { end.col } else { max_col };
-            (s.min(max_col), e.min(max_col))
-        }
-    }
-}
-
-/// True when `row` ends on a cell whose `WRAPLINE` flag is set. That's
-/// alacritty's way of marking "row continues into row+1 mid-token".
-fn row_is_wrapped<T>(term: &Term<T>, row: u16, cols: u16, offset: i32) -> bool {
-    if cols == 0 {
-        return false;
-    }
-    let line = row as i32 - offset;
-    let point = Point::new(Line(line), Column((cols - 1) as usize));
-    term.grid()[point].flags.contains(Flags::WRAPLINE)
-}
-
-/// Expand a char-mode range into a word-mode one by growing both ends
-/// outward across `is_word_char` runs. Called after `begin` when
-/// `granularity == Word`. Mutates `sel` in place.
-pub fn snap_to_word<T>(sel: &mut SelectionState, term: &Term<T>) {
-    let Some(anchor) = sel.anchor else {
-        return;
-    };
-    let cols = term.grid().columns() as u16;
-    let offset = term.grid().display_offset() as i32;
-
-    // Snap the anchor leftward.
-    let left = word_boundary_left(term, anchor.row, anchor.col, cols, offset);
-    // Snap the cursor rightward (may equal anchor on a fresh double-click).
-    let right = word_boundary_right(term, anchor.row, anchor.col, cols, offset);
-    sel.anchor = Some(Cell {
-        row: anchor.row,
-        col: left,
-    });
-    sel.cursor = Cell {
-        row: anchor.row,
-        col: right,
-    };
-}
-
-fn word_boundary_left<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset: i32) -> u16 {
-    let line = row as i32 - offset;
-    let mut c = col;
-    let start_char = char_at(term, line, c, cols);
-    if !start_char.is_some_and(is_word_char) {
-        return c;
-    }
-    while c > 0 {
-        let next = c - 1;
-        match char_at(term, line, next, cols) {
-            Some(ch) if is_word_char(ch) => c = next,
-            _ => break,
-        }
-    }
-    c
-}
-
-fn word_boundary_right<T>(term: &Term<T>, row: u16, col: u16, cols: u16, offset: i32) -> u16 {
-    let line = row as i32 - offset;
-    let mut c = col;
-    let start_char = char_at(term, line, c, cols);
-    if !start_char.is_some_and(is_word_char) {
-        return c;
-    }
-    let last = cols.saturating_sub(1);
-    while c < last {
-        let next = c + 1;
-        match char_at(term, line, next, cols) {
-            Some(ch) if is_word_char(ch) => c = next,
-            _ => break,
-        }
-    }
-    c
-}
-
-fn char_at<T>(term: &Term<T>, line: i32, col: u16, cols: u16) -> Option<char> {
-    if col >= cols {
-        return None;
-    }
-    let point = Point::new(Line(line), Column(col as usize));
-    let ch = term.grid()[point].c;
-    if ch == '\0' { None } else { Some(ch) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::{Column, Line};
     use std::time::Duration;
 
     fn cell(row: u16, col: u16) -> Cell {
         Cell { row, col }
     }
+
+    fn point(line: i32, col: usize) -> Point {
+        Point::new(Line(line), Column(col))
+    }
+
+    // --- ClickStreak (PTY-side, absolute grid coords) ---
+
+    #[test]
+    fn streak_first_click_is_char() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        assert_eq!(s.begin(point(0, 0), now), Granularity::Char);
+    }
+
+    #[test]
+    fn streak_second_click_same_point_promotes_to_word() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(-2, 3), now);
+        assert_eq!(
+            s.begin(point(-2, 3), now + Duration::from_millis(100)),
+            Granularity::Word
+        );
+    }
+
+    #[test]
+    fn streak_third_click_same_point_promotes_to_line() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(0, 0), now);
+        s.begin(point(0, 0), now + Duration::from_millis(100));
+        assert_eq!(
+            s.begin(point(0, 0), now + Duration::from_millis(200)),
+            Granularity::Line
+        );
+    }
+
+    #[test]
+    fn streak_fourth_click_wraps_back_to_char() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(0, 0), now);
+        s.begin(point(0, 0), now + Duration::from_millis(50));
+        s.begin(point(0, 0), now + Duration::from_millis(100));
+        assert_eq!(
+            s.begin(point(0, 0), now + Duration::from_millis(150)),
+            Granularity::Char
+        );
+    }
+
+    #[test]
+    fn streak_different_point_restarts() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(0, 0), now);
+        // Click at a different point within the window: no promotion.
+        assert_eq!(
+            s.begin(point(-1, 0), now + Duration::from_millis(100)),
+            Granularity::Char
+        );
+    }
+
+    #[test]
+    fn streak_expired_window_restarts() {
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(0, 0), now);
+        assert_eq!(
+            s.begin(point(0, 0), now + Duration::from_millis(500)),
+            Granularity::Char
+        );
+    }
+
+    #[test]
+    fn streak_survives_streaming_rebase() {
+        // The stored click point is an absolute grid coordinate: when
+        // the child streams N new lines, the same visual spot shifts by
+        // -N in Line space. A streak that tracked viewport rows would
+        // break; absolute points keep promoting.
+        let mut s = ClickStreak::default();
+        let now = Instant::now();
+        s.begin(point(0, 5), now);
+        // Content scrolled up by 3 lines: same visual cell is now Line(-3).
+        assert_eq!(
+            s.begin(point(-3, 5), now + Duration::from_millis(100)),
+            Granularity::Char,
+            "different absolute point must restart the streak"
+        );
+        // But two clicks on the SAME streamed content still promote.
+        assert_eq!(
+            s.begin(point(-3, 5), now + Duration::from_millis(200)),
+            Granularity::Word
+        );
+    }
+
+    // --- SelectionState (viewer-side, viewport-relative) ---
 
     #[test]
     fn begin_default_is_char_mode() {
@@ -395,262 +368,40 @@ mod tests {
     }
 
     #[test]
-    fn second_click_same_cell_promotes_to_word() {
+    fn double_click_within_window_promotes_to_word() {
         let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(2, 5), t0);
-        s.begin(cell(2, 5), t0 + Duration::from_millis(100));
+        let now = Instant::now();
+        s.begin(cell(1, 2), now);
+        s.begin(cell(1, 2), now + Duration::from_millis(200));
         assert_eq!(s.granularity(), Granularity::Word);
     }
 
     #[test]
-    fn third_click_promotes_to_line() {
+    fn selection_clear_resets_highlight_but_keeps_streak_info() {
         let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(2, 5), t0);
-        s.begin(cell(2, 5), t0 + Duration::from_millis(100));
-        s.begin(cell(2, 5), t0 + Duration::from_millis(200));
-        assert_eq!(s.granularity(), Granularity::Line);
-    }
-
-    #[test]
-    fn fourth_click_wraps_back_to_char() {
-        let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(2, 5), t0);
-        s.begin(cell(2, 5), t0 + Duration::from_millis(100));
-        s.begin(cell(2, 5), t0 + Duration::from_millis(200));
-        s.begin(cell(2, 5), t0 + Duration::from_millis(300));
-        assert_eq!(s.granularity(), Granularity::Char);
-    }
-
-    #[test]
-    fn slow_second_click_stays_char() {
-        let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(2, 5), t0);
-        s.begin(cell(2, 5), t0 + Duration::from_millis(500));
-        assert_eq!(s.granularity(), Granularity::Char);
-    }
-
-    #[test]
-    fn different_cell_resets_streak() {
-        let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(2, 5), t0);
-        s.begin(cell(2, 6), t0 + Duration::from_millis(100));
-        assert_eq!(s.granularity(), Granularity::Char);
-    }
-
-    #[test]
-    fn extend_moves_cursor_but_not_anchor() {
-        let mut s = SelectionState::default();
-        s.begin(cell(0, 0), Instant::now());
-        s.extend(cell(3, 10));
-        let (start, end) = s.char_range().unwrap();
-        assert_eq!(start, cell(0, 0));
-        assert_eq!(end, cell(3, 10));
-    }
-
-    #[test]
-    fn reverse_drag_normalizes_range() {
-        let mut s = SelectionState::default();
-        s.begin(cell(5, 20), Instant::now());
-        s.extend(cell(2, 5));
-        let (start, end) = s.char_range().unwrap();
-        assert_eq!(start, cell(2, 5));
-        assert_eq!(end, cell(5, 20));
-    }
-
-    #[test]
-    fn commit_freezes_but_keeps_range() {
-        let mut s = SelectionState::default();
-        s.begin(cell(0, 0), Instant::now());
-        s.extend(cell(0, 5));
-        s.commit();
-        assert!(s.is_frozen());
-        assert!(s.is_active());
-        assert_eq!(s.char_range().unwrap().1, cell(0, 5));
-    }
-
-    #[test]
-    fn clear_wipes_selection() {
-        let mut s = SelectionState::default();
-        s.begin(cell(0, 0), Instant::now());
-        s.extend(cell(0, 5));
+        let now = Instant::now();
+        s.begin(cell(0, 0), now);
+        s.extend(cell(2, 2));
         s.commit();
         s.clear();
         assert!(!s.is_active());
-        assert!(s.char_range().is_none());
+        // last_click kept: a quick re-click still promotes.
+        s.begin(cell(0, 0), now + Duration::from_millis(50));
+        assert_eq!(s.granularity(), Granularity::Word);
     }
 
     #[test]
-    fn char_contains_single_row() {
+    fn contains_flows_past_cursor_in_word_line_modes() {
         let mut s = SelectionState::default();
-        s.begin(cell(3, 5), Instant::now());
-        s.extend(cell(3, 10));
-        assert!(s.contains(3, 5, 80));
-        assert!(s.contains(3, 10, 80));
-        assert!(!s.contains(3, 4, 80));
-        assert!(!s.contains(3, 11, 80));
-        assert!(!s.contains(4, 5, 80));
-    }
-
-    #[test]
-    fn char_contains_multi_row_flows_first_and_last() {
-        let mut s = SelectionState::default();
-        s.begin(cell(2, 70), Instant::now());
-        s.extend(cell(4, 3));
-        // First row: 70..end.
-        assert!(s.contains(2, 70, 80));
-        assert!(s.contains(2, 79, 80));
-        assert!(!s.contains(2, 69, 80));
-        // Middle row: fully highlighted.
-        assert!(s.contains(3, 0, 80));
-        assert!(s.contains(3, 79, 80));
-        // Last row: 0..=3.
-        assert!(s.contains(4, 0, 80));
-        assert!(s.contains(4, 3, 80));
-        assert!(!s.contains(4, 4, 80));
-    }
-
-    #[test]
-    fn line_mode_ignores_columns() {
-        let mut s = SelectionState::default();
-        let t0 = Instant::now();
-        s.begin(cell(3, 5), t0);
-        s.begin(cell(3, 5), t0 + Duration::from_millis(50));
-        s.begin(cell(3, 5), t0 + Duration::from_millis(100));
-        assert_eq!(s.granularity(), Granularity::Line);
-        assert!(s.contains(3, 0, 80));
-        assert!(s.contains(3, 79, 80));
-        assert!(!s.contains(2, 5, 80));
-        assert!(!s.contains(4, 5, 80));
-    }
-
-    #[test]
-    fn shift_extend_promotes_to_char_if_no_anchor() {
-        let mut s = SelectionState::default();
-        s.shift_extend(cell(0, 5));
-        assert!(s.is_active());
-        assert_eq!(s.granularity(), Granularity::Char);
-        assert_eq!(s.char_range().unwrap(), (cell(0, 5), cell(0, 5)));
-    }
-
-    #[test]
-    fn is_word_char_recognises_punctuation_break() {
-        assert!(is_word_char('a'));
-        assert!(is_word_char('9'));
-        assert!(is_word_char('/'));
-        assert!(is_word_char('.'));
-        assert!(is_word_char('-'));
-        assert!(is_word_char('_'));
-        assert!(!is_word_char(' '));
-        assert!(!is_word_char('\t'));
-        assert!(!is_word_char('('));
-        assert!(!is_word_char(','));
-    }
-
-    // --- Regression: extraction must follow `display_offset` ---
-    //
-    // The render path draws viewport row `r` from grid line
-    // `r - display_offset`, so a scrolled-up pane highlights scrollback
-    // content. Extraction used to index `Line(r)` directly — the active
-    // screen — making the copied text diverge from the highlight.
-
-    use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Scroll;
-    use alacritty_terminal::term::Config as TermConfig;
-    use alacritty_terminal::vte::ansi::Processor;
-
-    struct TestDims {
-        columns: usize,
-        screen_lines: usize,
-    }
-
-    impl Dimensions for TestDims {
-        fn total_lines(&self) -> usize {
-            self.screen_lines
-        }
-        fn screen_lines(&self) -> usize {
-            self.screen_lines
-        }
-        fn columns(&self) -> usize {
-            self.columns
-        }
-    }
-
-    /// Real alacritty `Term` fed `bytes`, then scrolled up `delta`
-    /// lines — mirrors the pane's wheel-scroll path
-    /// (`Session::scroll_lines` → `Term::scroll_display`).
-    fn scrolled_term(bytes: &[u8], cols: usize, rows: usize, delta: i32) -> Term<VoidListener> {
-        let dims = TestDims {
-            columns: cols,
-            screen_lines: rows,
-        };
-        let mut term = Term::new(TermConfig::default(), &dims, VoidListener);
-        let mut processor: Processor = Processor::new();
-        processor.advance(&mut term, bytes);
-        term.scroll_display(Scroll::Delta(delta));
-        assert_eq!(term.grid().display_offset(), delta as usize);
-        term
-    }
-
-    #[test]
-    fn extract_reads_scrollback_line_under_highlight() {
-        // 6 lines in a 3-row terminal: active screen holds "3","4","5";
-        // scrolling up 2 puts "1","2","3" in the viewport.
-        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
-
-        let mut sel = SelectionState::default();
-        sel.begin(cell(0, 0), Instant::now());
-        sel.extend(cell(0, 0));
-
-        // Viewport row 0 shows "1", not grid Line(0) which holds "3".
-        assert_eq!(extract_text(&term, &sel).unwrap(), "1");
-    }
-
-    #[test]
-    fn extract_multiline_selection_respects_scrollback() {
-        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
-
-        let mut sel = SelectionState::default();
-        sel.begin(cell(0, 0), Instant::now());
-        sel.extend(cell(1, 0));
-
-        // Viewport rows 0..=1 show "1","2"; active-screen rows hold "3","4".
-        assert_eq!(extract_text(&term, &sel).unwrap(), "1\n2");
-    }
-
-    #[test]
-    fn line_mode_selection_reads_visible_line() {
-        let term = scrolled_term(b"0\r\n1\r\n2\r\n3\r\n4\r\n5", 10, 3, 2);
-
         let now = Instant::now();
-        let mut sel = SelectionState::default();
-        sel.begin(cell(2, 0), now);
-        sel.begin(cell(2, 0), now);
-        sel.begin(cell(2, 0), now); // triple-click → Line
-        assert_eq!(sel.granularity(), Granularity::Line);
-
-        // Viewport row 2 shows "3"; grid Line(2) holds "5".
-        assert_eq!(extract_text(&term, &sel).unwrap(), "3");
-    }
-
-    #[test]
-    fn word_snap_uses_visible_line() {
-        let term = scrolled_term(b"alpha beta\r\ngamma delta\r\n1\r\n2\r\n3", 20, 3, 2);
-
-        let now = Instant::now();
-        let mut sel = SelectionState::default();
-        sel.begin(cell(0, 2), now);
-        sel.begin(cell(0, 2), now); // double-click → Word
-        assert_eq!(sel.granularity(), Granularity::Word);
-
-        snap_to_word(&mut sel, &term);
-        let (start, end) = sel.char_range().unwrap();
-        assert_eq!((start.row, start.col), (0, 0));
-        assert_eq!((end.row, end.col), (0, 4));
-        assert_eq!(extract_text(&term, &sel).unwrap(), "alpha");
+        s.begin(cell(0, 0), now);
+        s.extend(cell(1, 2));
+        // char mode: flowed rectangle over rows 0..=1
+        assert!(s.contains(0, 0, 10));
+        assert!(s.contains(0, 9, 10));
+        assert!(s.contains(1, 0, 10));
+        assert!(s.contains(1, 2, 10));
+        assert!(!s.contains(1, 3, 10));
+        assert!(!s.contains(2, 0, 10));
     }
 }

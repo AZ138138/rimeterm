@@ -446,6 +446,14 @@ impl Session {
         self.render_dirty.take()
     }
 
+    /// Mark the session render-dirty without touching the grid. Used by
+    /// local selection mutations that don't come from the PTY reader
+    /// (e.g. rimeterm-owned mouse selections anchored in
+    /// `Term.selection`) so the next `render` repaints.
+    pub fn mark_render_dirty(&self) {
+        self.render_dirty.mark();
+    }
+
     /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
     ///
     /// Uses the independent killer handle so we never race the reaper

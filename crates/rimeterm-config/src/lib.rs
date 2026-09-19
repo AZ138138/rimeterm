@@ -128,10 +128,11 @@ impl Default for ViewerMarkdownConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MouseConfig {
-    /// When `true` (default), `Down(Right)` on agents / shells panes
-    /// pastes the clipboard (matching Windows Terminal / conhost /
-    /// iTerm2 defaults). Set to `false` to restore the legacy
-    /// "copy-and-clear active selection, no paste" behaviour.
+    /// When `true` (default), right-click on agents / shells panes uses
+    /// two-step semantics: with an active selection, `Down(Right)`
+    /// copies it and clears the highlight; with no selection,
+    /// `Down(Right)` pastes the clipboard at the caret. Set to `false`
+    /// for copy-only right-clicks (no paste step).
     ///
     /// Quick Look (left-column preview zone) is **read-only** and
     /// always uses copy semantics regardless of this flag —

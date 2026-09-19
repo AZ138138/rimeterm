@@ -141,9 +141,21 @@ pub trait PaneProvider: Send + 'static {
     }
 
     /// Whether this pane currently owns an active local scrollbar drag.
-    /// The app uses this to keep delivering Drag/Up after the pointer leaves
-    /// the pane rectangle. Default is false for non-scrollable providers.
+    /// The app uses this to keep delivering Drag/Up events to the pane
+    /// that started the drag after the pointer leaves the pane rect, so
+    /// the thumb keeps tracking. Default is false for non-scrollable
+    /// providers.
     fn scrollbar_dragging(&self) -> bool {
+        false
+    }
+
+    /// True while the user is actively dragging a local text selection
+    /// that started inside this pane. The app routes every Drag / Up
+    /// event to the pane that owns the drag (sticky routing), so the
+    /// selection keeps extending even when the pointer leaves the pane
+    /// rect — mirrors [`PaneProvider::scrollbar_dragging`]. Default is
+    /// false for providers without local text selection.
+    fn text_selection_dragging(&self) -> bool {
         false
     }
 
@@ -205,15 +217,16 @@ pub trait PaneProvider: Send + 'static {
         let _ = on;
     }
 
-    /// §19.14.4: enable "right-click = paste" semantics. When `on` the
-    /// pane's `Down(Right)` handler pastes the clipboard (after copying
-    /// any active selection). App sets `true` on agents / shells panes.
-    /// Files-column panes (yazi / gitui) keep the default `false` so
-    /// right-clicks forward to the child's own context menu.
+    /// Enable the paste step of the two-step right-click protocol on
+    /// this pane. With an active selection, `Down(Right)` always copies
+    /// and clears; `on == true` adds "no selection → paste clipboard".
+    /// App sets `true` on agents / shells panes; files-column panes
+    /// keep the default `false` so right-clicks forward to the child's
+    /// own context menu.
     ///
-    /// Read-only panes (bottom, PTY children with no stdin) transparently
-    /// downgrade to "copy only" — the paste attempt is a silent no-op
-    /// when the write path is closed.
+    /// Read-only panes (PTY children with no stdin) transparently
+    /// downgrade the paste to a no-op — the bytes route through
+    /// `Session::write`, which is silent when the write path is closed.
     fn set_right_click_paste(&mut self, on: bool) {
         let _ = on;
     }

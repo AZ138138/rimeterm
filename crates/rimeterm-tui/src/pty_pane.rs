@@ -17,13 +17,15 @@ use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderO
 use rimeterm_pty::{Decision, ResizeThrottle, Session};
 
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
 
 use std::time::Instant;
 
-use crate::pty_selection::{self, Cell as SelCell, Granularity, SelectionState};
+use crate::pty_selection::{ClickStreak, Granularity};
 
 pub struct PtyPane {
     id: PaneId,
@@ -33,9 +35,22 @@ pub struct PtyPane {
     /// PTY resize throttler (§19.12.6). See [`rimeterm_pty::ResizeThrottle`].
     resize: ResizeThrottle,
     /// C22.6: local text selection when the child hasn't asked for xterm
-    /// mouse reports. Rendered as a reverse-video overlay in `render` and
-    /// copied to the system clipboard on mouse-up.
-    selection: SelectionState,
+    /// mouse reports. The selection itself lives inside alacritty's
+    /// `Term.selection` in **absolute grid coordinates** (see
+    /// [`crate::pty_selection`]), so it rotates with streaming output
+    /// and survives viewport scrolling. This field only tracks the UI
+    /// state machine: click-streak granularity promotion.
+    click_streak: ClickStreak,
+    /// Granularity of the current/most recent selection (kept locally
+    /// because alacritty's `Selection` doesn't expose its type).
+    granularity: Granularity,
+    /// Active local text-selection drag: inner rect + last pointer
+    /// position. Set on `Down(Left)` in local mode, updated on `Drag`,
+    /// cleared on `Up`. Drives App-level sticky routing (Drag/Up keep
+    /// reaching this pane after the pointer leaves it) and
+    /// `poll_background` edge autoscroll while the pointer rests
+    /// above/below the pane.
+    text_drag: Option<TextDrag>,
     /// When `true` the pane never owns the mouse for local text selection
     /// / middle-click paste — every mouse event either forwards to the
     /// child as SGR bytes (when the child asked for xterm mouse) or is
@@ -43,9 +58,10 @@ pub struct PtyPane {
     /// rimeterm's own D1/D2 divider drag: App::on_mouse checks dividers
     /// BEFORE pane-priority, so the seams stay draggable.
     mouse_passthrough: bool,
-    /// §19.14.4: `Down(Right)` semantics. `false` = legacy copy-only;
-    /// `true` = copy any active selection then paste from clipboard
-    /// (agents / shells).
+    /// §19.14.4: `Down(Right)` semantics. Two-step protocol: with an
+    /// active selection, right-click copies + clears; without one,
+    /// `true` pastes the clipboard (agents / shells), `false` swallows
+    /// the click (copy-only panes).
     right_click_paste: bool,
     /// §19.14.6 invariant 34: origin of the current `Left` drag session.
     /// Set on `Down(Left)`, consulted by `Drag` / `Up`, cleared on
@@ -85,16 +101,27 @@ pub struct PtyPane {
     /// P0-2: focus state at the time of the last paint. Focus flips
     /// change the border color and the `▶` title marker — repaint.
     last_focused: bool,
-    /// P0-2: whether the selection overlay was active at the time of
-    /// the last paint. Selection extent isn't easily hashable, so we
-    /// use "was it active" as the coarse invalidation trigger — any
-    /// active-selection mouse drag also raises alacritty damage via
-    /// the cursor position update, so we rarely miss a real change.
-    last_selection_active: bool,
     last_cursor_row: u16,
     last_cursor_col: u16,
     last_hide_cursor: bool,
     last_history_size: usize,
+}
+
+/// Live state of a local Left-drag text selection (see
+/// [`PtyPane::text_drag`]).
+#[derive(Copy, Clone)]
+struct TextDrag {
+    /// Inner rect captured at `Down` — coordinate frame for `col`/`row`
+    /// and the autoscroll edge bands.
+    inner: Rect,
+    /// Last pointer position (screen coords; may overshoot `inner`).
+    col: u16,
+    row: u16,
+    /// Whether the pointer moved (a `Drag` arrived) or the Down itself
+    // was an intentional selection act (Shift+extend, word/line click
+    // streak). Distinguishes a commit-worthy drag from a bare click,
+    // which must clear instead of copying one cell.
+    moved: bool,
 }
 
 impl PtyPane {
@@ -108,7 +135,9 @@ impl PtyPane {
             session,
             last_area: Rect::default(),
             resize: ResizeThrottle::platform(),
-            selection: SelectionState::default(),
+            click_streak: ClickStreak::default(),
+            granularity: Granularity::default(),
+            text_drag: None,
             mouse_passthrough: false,
             right_click_paste: false,
             drag_forward_active: None,
@@ -118,7 +147,6 @@ impl PtyPane {
             last_render: None,
             last_display_offset: 0,
             last_focused: false,
-            last_selection_active: false,
             last_cursor_row: 0,
             last_cursor_col: 0,
             last_hide_cursor: true,
@@ -133,7 +161,7 @@ impl PtyPane {
     pub fn set_mouse_passthrough(&mut self, on: bool) {
         self.mouse_passthrough = on;
         if on {
-            self.selection.clear();
+            self.clear_selection();
         }
     }
 
@@ -213,12 +241,7 @@ impl PtyPane {
     /// handler. Silent no-op when the selection is empty or the
     /// clipboard is unavailable (headless CI, locked session).
     fn copy_selection(&mut self) {
-        if !self.selection.is_active() {
-            return;
-        }
-        let text = self
-            .session
-            .with_term(|term| pty_selection::extract_text(term, &self.selection));
+        let text = self.session.with_term(|term| term.selection_to_string());
         let Some(text) = text else {
             return;
         };
@@ -263,33 +286,35 @@ impl PtyPane {
         let _ = self.session.write(&buf);
     }
 
-    /// Return the (inner-relative) [`SelCell`] for a mouse click at
-    /// absolute `(col, row)` when the click lands inside `outer_rect`'s
-    /// inner area. `None` when it hits the border cells.
-    fn selection_cell_at(&self, col: u16, row: u16, outer_rect: Rect) -> Option<SelCell> {
-        let inner = inner_rect(outer_rect);
-        if !point_in_rect(col, row, inner) {
-            return None;
-        }
-        Some(SelCell {
-            row: row.saturating_sub(inner.y),
-            col: col.saturating_sub(inner.x),
-        })
+    /// True when an alacritty-anchored selection exists.
+    fn has_selection(&self) -> bool {
+        self.session.with_term(|term| term.selection.is_some())
     }
 
-    /// Adapter for Drag events: clamps `(col, row)` into `outer_rect`'s
-    /// inner area so overshoots stay bounded.
-    fn selection_cell_clamped(&self, col: u16, row: u16, outer_rect: Rect) -> SelCell {
-        let inner = inner_rect(outer_rect);
-        // Guard against zero-width / zero-height inner rects.
-        let right = inner.x.saturating_add(inner.width.saturating_sub(1));
-        let bottom = inner.y.saturating_add(inner.height.saturating_sub(1));
-        let x = col.clamp(inner.x, right.max(inner.x));
-        let y = row.clamp(inner.y, bottom.max(inner.y));
-        SelCell {
-            row: y.saturating_sub(inner.y),
-            col: x.saturating_sub(inner.x),
+    /// Clear the alacritty-anchored selection and any live drag state.
+    fn clear_selection(&mut self) {
+        self.text_drag = None;
+        if self.has_selection() {
+            self.click_streak.reset();
+            self.session.with_term_mut(|term| term.selection = None);
+            self.session.mark_render_dirty();
         }
+    }
+
+    /// Extend the active selection to the last observed drag position
+    /// (`text_drag`). Called from the `Drag` handler and from
+    /// `poll_background` edge autoscroll. Follows alacritty's
+    /// `vi_mode_recompute_selection` protocol (`update` +
+    /// `include_all`) so the range is inclusive on both ends regardless
+    /// of drag direction.
+    fn extend_selection_to_pointer(&mut self) {
+        let Some(td) = self.text_drag else { return };
+        self.session.with_term_mut(|term| {
+            let offset = term.grid().display_offset();
+            let point = grid_point_drag(td.col, td.row, td.inner, offset, term);
+            selection_extend_to(&mut term.selection, point);
+        });
+        self.session.mark_render_dirty();
     }
 }
 
@@ -366,7 +391,6 @@ impl PaneProvider for PtyPane {
         // Cheap poll — no-op when nothing is pending.
         self.tick_resize(Instant::now());
 
-        let selection_active_now = self.selection.is_active();
         let session_dirty = self.session.take_render_dirty();
         let refresh_term =
             needs_term_refresh(session_dirty, area_changed, self.last_render.is_some());
@@ -424,15 +448,20 @@ impl PaneProvider for PtyPane {
             blit_buffer_at(snap, buf, (inner.x, inner.y));
         }
 
-        // C22.6 selection overlay. Painted AFTER the grid blit so
-        // reverse-video wins over the shell's own colours. Line/word
-        // modes are handled inside `SelectionState::contains` which
-        // knows how to flow past the raw cursor.
-        if selection_active_now {
-            let cols = inner.width;
+        // C22.6 selection overlay: alacritty-normalized range in
+        // absolute grid coords, mapped back through the current
+        // display offset. Painted AFTER the grid blit so reverse-video
+        // wins over the shell's own colours. Fetched fresh every frame
+        // (cheap uncontended lock) so the overlay tracks drags even on
+        // the snapshot fast path.
+        let sel_range = self
+            .session
+            .with_term(|term| term.selection.as_ref().and_then(|s| s.to_range(term)));
+        if let Some(sel) = sel_range {
             for row in 0..inner.height {
+                let line = Line(i32::from(row) - display_offset as i32);
                 for col in 0..inner.width {
-                    if self.selection.contains(row, col, cols) {
+                    if sel.contains(Point::new(line, Column(usize::from(col)))) {
                         let target = &mut buf[(inner.x + col, inner.y + row)];
                         let style = target.style().add_modifier(Modifier::REVERSED);
                         target.set_style(style);
@@ -496,12 +525,31 @@ impl PaneProvider for PtyPane {
         self.last_hide_cursor = vt_hide_cursor;
         self.last_history_size = history_size;
         self.last_focused = ctx.focused;
-        self.last_selection_active = selection_active_now;
 
         RenderOutcome {
             request_redraw: false,
             cursor,
         }
+    }
+
+    /// Edge autoscroll while a local text-selection drag rests outside
+    /// the pane's vertical bounds. The app calls this every main-loop
+    /// iteration (~16 ms idle cadence), so holding the pointer past an
+    /// edge scrolls ~60 lines/s without needing mouse movement.
+    fn poll_background(&mut self) -> bool {
+        let Some(td) = self.text_drag else {
+            return false;
+        };
+        if !self.scrollback_enabled {
+            return false;
+        }
+        let delta = edge_scroll_delta(td.row, td.inner);
+        if delta == 0 {
+            return false;
+        }
+        self.session.scroll_lines(delta);
+        self.extend_selection_to_pointer();
+        true
     }
 
     fn flush_pending_resize(&mut self) {
@@ -531,8 +579,8 @@ impl PaneProvider for PtyPane {
         }
         // Esc clears an active selection before falling through to the
         // child. Otherwise a leftover highlight after copy is annoying.
-        if key.code == KeyCode::Esc && self.selection.is_active() {
-            self.selection.clear();
+        if key.code == KeyCode::Esc && self.has_selection() {
+            self.clear_selection();
             // Don't `return true` — the child might want Esc too
             // (e.g. vim mode-switch). Just consumed the highlight.
         }
@@ -549,11 +597,15 @@ impl PaneProvider for PtyPane {
     }
 
     fn has_active_selection(&self) -> bool {
-        self.selection.is_active()
+        self.has_selection()
     }
 
     fn scrollbar_dragging(&self) -> bool {
         self.scrollbar_drag
+    }
+
+    fn text_selection_dragging(&self) -> bool {
+        self.text_drag.is_some()
     }
 
     fn set_scrollback_enabled(&mut self, on: bool) {
@@ -606,7 +658,7 @@ impl PaneProvider for PtyPane {
         {
             self.scrollbar_drag = true;
             self.drag_forward_active = None;
-            self.selection.clear();
+            self.clear_selection();
             self.scroll_to_scrollbar_row(ev.row);
             return true;
         }
@@ -649,7 +701,7 @@ impl PaneProvider for PtyPane {
             // Any local selection needs to be dropped before we hand
             // control back to the child — otherwise a stale highlight
             // stays on screen after a `less` invocation exits.
-            self.selection.clear();
+            self.clear_selection();
             // xterm SGR mouse expects **1-based, inside-content**
             // coordinates. Points outside inner (drag overshoot) clamp
             // to the border so we never send negative-ish coords.
@@ -665,79 +717,125 @@ impl PaneProvider for PtyPane {
         // --- Local ownership: selection + paste ---
         match ev.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.scrollback_enabled => {
+                // Viewport scrolling only moves the display window;
+                // the selection is anchored in absolute grid coords and
+                // stays put — no clear needed (alacritty behaviour).
                 if let Some(lines) = wheel_scroll_lines(ev.kind) {
-                    self.selection.clear();
                     self.session.scroll_lines(lines);
                     return true;
                 }
                 false
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(cell) = self.selection_cell_at(ev.column, ev.row, outer_rect) {
-                    if shift {
-                        // Shift+Left grows the existing selection.
-                        self.selection.shift_extend(cell);
-                    } else {
-                        self.selection.begin(cell, Instant::now());
-                        if self.selection.granularity() == Granularity::Word {
-                            self.session.with_term(|term| {
-                                pty_selection::snap_to_word(&mut self.selection, term)
-                            });
-                        }
-                    }
-                    return true;
+                if !point_in_rect(ev.column, ev.row, inner) {
+                    return false;
                 }
-                false
+                let point = self.session.with_term(|term| {
+                    grid_point_at(ev.column, ev.row, inner, term.grid().display_offset())
+                });
+                // Shift+Left on an existing selection extends it toward
+                // the clicked cell (xterm convention); the anchor
+                // re-anchors at the far end inside the closure below.
+                // Without a selection it starts fresh, with
+                // streak-promoted granularity.
+                let extend = shift && self.has_selection();
+                let gran = if extend {
+                    self.granularity
+                } else {
+                    self.click_streak.begin(point, Instant::now())
+                };
+                self.granularity = gran;
+                self.session.with_term_mut(|term| {
+                    let anchor = if extend {
+                        term.selection
+                            .as_ref()
+                            .and_then(|s| s.to_range(term))
+                            .map(|r| if point <= r.start { r.end } else { r.start })
+                    } else {
+                        None
+                    };
+                    selection_begin_or_extend(
+                        &mut term.selection,
+                        selection_ty(gran),
+                        anchor,
+                        point,
+                    );
+                });
+                self.text_drag = Some(TextDrag {
+                    inner,
+                    col: ev.column,
+                    row: ev.row,
+                    // Word/line streak clicks and Shift+extend are
+                    // commits even without movement.
+                    moved: extend || gran != Granularity::Char,
+                });
+                self.session.mark_render_dirty();
+                true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.selection.is_active() {
-                    if self.scrollback_enabled {
-                        let inner = inner_rect(outer_rect);
-                        if inner.height > 0 {
-                            if ev.row < inner.y {
-                                self.session.scroll_lines(1);
-                            } else if ev.row >= inner.y.saturating_add(inner.height) {
-                                self.session.scroll_lines(-1);
-                            }
-                        }
-                    }
-                    let cell = self.selection_cell_clamped(ev.column, ev.row, outer_rect);
-                    self.selection.extend(cell);
-                    return true;
+                if self.text_drag.is_none() {
+                    return false;
                 }
-                false
+                // Immediate edge autoscroll on movement; holding the
+                // pointer still outside an edge is driven by
+                // `poll_background`. Same kernel as `poll_background`
+                // so the two can't drift.
+                if self.scrollback_enabled {
+                    let delta = edge_scroll_delta(ev.row, inner);
+                    if delta != 0 {
+                        self.session.scroll_lines(delta);
+                    }
+                }
+                let mut td = self.text_drag.unwrap();
+                td.col = ev.column;
+                td.row = ev.row;
+                td.moved = true;
+                self.text_drag = Some(td);
+                self.extend_selection_to_pointer();
+                true
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if self.selection.is_active() {
-                    self.selection.commit();
-                    self.copy_selection();
-                    return true;
+                if let Some(td) = self.text_drag.take() {
+                    if td.moved {
+                        // Commit: copy to the clipboard, keep the
+                        // highlight (alacritty keeps `Term.selection`
+                        // until the next Down / clear).
+                        self.copy_selection();
+                    } else {
+                        // Bare click: drop the one-cell selection the
+                        // Down seeded — a click shouldn't clobber the
+                        // clipboard with a single char. Inline (not
+                        // `clear_selection`) so the click streak stays
+                        // primed for the double-click that follows.
+                        self.session.with_term_mut(|term| term.selection = None);
+                    }
+                    self.session.mark_render_dirty();
+                    true
+                } else {
+                    false
                 }
-                false
             }
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.paste_from_clipboard();
                 true
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                // §19.14.4 right-click semantics.
-                //
-                // 1. Any active selection is copied first (so users
-                //    who framed text with Left-drag can still "finish"
-                //    with a right-click, matching Windows Terminal's
-                //    "selection + right = copy" muscle memory).
-                // 2. Then, when `right_click_paste` is enabled, paste
-                //    the clipboard.
-                // 3. Read-only children transparently drop the paste
-                //    bytes because `paste_from_clipboard` routes through
-                //    `Session::write`, which is a no-op when the child
-                //    has no stdin.
-                if self.selection.is_active() {
-                    self.copy_selection();
-                    self.selection.clear();
-                }
-                if self.right_click_paste {
-                    self.paste_from_clipboard();
+                // §19.14.4 right-click semantics (two-step revision):
+                // right-click with an active selection COPIES and clears;
+                // right-click with no selection PASTES. Splitting the old
+                // copy-then-immediately-paste into two clicks lets the
+                // user move the caret / click into another pane between
+                // copy and paste — they choose where the text lands.
+                // Read-only children transparently drop paste bytes
+                // because `paste_from_clipboard` routes through
+                // `Session::write`, a no-op when the child has no stdin.
+                match right_click_action(self.has_selection(), self.right_click_paste) {
+                    RightClickAction::CopyThenClear => {
+                        self.copy_selection();
+                        self.clear_selection();
+                    }
+                    RightClickAction::Paste => self.paste_from_clipboard(),
+                    RightClickAction::None => {}
                 }
                 true
             }
@@ -889,8 +987,54 @@ fn wheel_scroll_lines(kind: MouseEventKind) -> Option<i32> {
     }
 }
 
+/// What a `Down(Right)` inside this pane should do, decided by whether
+/// text is selected and whether paste-after-copy is enabled:
+///
+/// - `CopyThenClear` — selection active: copy it to the clipboard and
+///   drop the highlight (the "框选 → 右键复制" step).
+/// - `Paste` — nothing selected and paste enabled: paste the clipboard
+///   at the current cursor (the "右键 → 粘贴" step; the user picks
+///   where by positioning the caret first).
+/// - `None` — nothing selected and paste disabled (legacy copy-only
+///   panes): swallow silently so the click never leaks to the child.
+///
+/// Splitting the old copy-then-immediately-paste into two right-clicks
+/// lets the user choose the paste position between copy and paste.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RightClickAction {
+    CopyThenClear,
+    Paste,
+    None,
+}
+
+fn right_click_action(has_selection: bool, paste_enabled: bool) -> RightClickAction {
+    if has_selection {
+        RightClickAction::CopyThenClear
+    } else if paste_enabled {
+        RightClickAction::Paste
+    } else {
+        RightClickAction::None
+    }
+}
+
 fn should_show_scrollbar(focused: bool, history_size: usize) -> bool {
     focused && history_size > 0
+}
+/// Vertical autoscroll delta for a drag pointer resting outside `inner`:
+/// +1 line/tick above the top edge, −1 below the bottom, 0 while inside.
+/// Shared by the immediate `Drag` handler and the `poll_background`
+/// hold-still tick so the two can never drift apart.
+fn edge_scroll_delta(row: u16, inner: Rect) -> i32 {
+    if inner.height == 0 {
+        return 0;
+    }
+    if row < inner.y {
+        1
+    } else if row >= inner.y.saturating_add(inner.height) {
+        -1
+    } else {
+        0
+    }
 }
 
 fn scrollbar_offset_for_row(row: u16, top: u16, height: u16, history_size: usize) -> usize {
@@ -902,6 +1046,72 @@ fn scrollbar_offset_for_row(row: u16, top: u16, height: u16, history_size: usize
     let from_top = usize::from(row.saturating_sub(top));
     let span = usize::from(height - 1);
     history_size.saturating_sub((from_top * history_size + span / 2) / span)
+}
+
+/// Screen position → absolute grid point for a click INSIDE `inner`.
+/// Inverse of [`viewport_row`]: viewport row `r` maps to grid line
+/// `r - display_offset`.
+pub(crate) fn grid_point_at(col: u16, row: u16, inner: Rect, display_offset: usize) -> Point {
+    Point::new(
+        Line(i32::from(row.saturating_sub(inner.y)) - display_offset as i32),
+        Column(usize::from(col.saturating_sub(inner.x))),
+    )
+}
+
+/// Screen position → absolute grid point for a drag that may OVERSHOOT
+/// `inner`: horizontally clamped to the content area, vertically
+/// extrapolated past the viewport (so edge autoscroll extends the
+/// selection into history) then clamped to the grid's absolute bounds.
+pub(crate) fn grid_point_drag<D: Dimensions>(
+    col: u16,
+    row: u16,
+    inner: Rect,
+    display_offset: usize,
+    dims: &D,
+) -> Point {
+    let right = inner.x.saturating_add(inner.width.saturating_sub(1));
+    let column =
+        usize::from(col.clamp(inner.x, right).saturating_sub(inner.x)).min(dims.last_column().0);
+    let rel = i32::from(row) - i32::from(inner.y);
+    let line = (rel - display_offset as i32).clamp(dims.topmost_line().0, dims.bottommost_line().0);
+    Point::new(Line(line), Column(column))
+}
+
+/// Begin or extend a selection to `point` using alacritty's
+/// `vi_mode_recompute_selection` protocol: `update(point, Side::Left)` +
+/// `include_all()`. The resulting `to_range` is inclusive on both ends
+/// regardless of drag direction, matching every other terminal.
+///
+/// `anchor` seeds a new selection (fresh Down); pass the far end of the
+/// existing range when Shift+Left extends an existing selection.
+fn selection_begin_or_extend(
+    term_selection: &mut Option<Selection>,
+    ty: SelectionType,
+    anchor: Option<Point>,
+    point: Point,
+) {
+    let mut sel = Selection::new(ty, anchor.unwrap_or(point), Side::Left);
+    sel.update(point, Side::Left);
+    sel.include_all();
+    *term_selection = Some(sel);
+}
+
+/// Extend an in-progress drag: same protocol as
+/// [`selection_begin_or_extend`] but keeps the existing selection's
+/// type and anchor. Mirrors alacritty's `vi_mode_recompute_selection`
+/// filter: a `None` selection is a no-op (drag without Down).
+fn selection_extend_to(term_selection: &mut Option<Selection>, point: Point) {
+    if let Some(selection) = term_selection.as_mut().filter(|s| !s.is_empty()) {
+        selection.update(point, Side::Left);
+        selection.include_all();
+    }
+}
+fn selection_ty(g: Granularity) -> SelectionType {
+    match g {
+        Granularity::Char => SelectionType::Simple,
+        Granularity::Word => SelectionType::Semantic,
+        Granularity::Line => SelectionType::Lines,
+    }
 }
 
 fn viewport_row(line: i32, display_offset: usize, viewport_height: usize) -> Option<usize> {
@@ -1364,6 +1574,29 @@ mod mouse_tests {
         assert!(!decide_forward_pure(down_left(), true, true, true));
     }
 
+    // --- right_click_action — the two-step Down(Right) protocol ---
+
+    #[test]
+    fn right_click_with_selection_always_copies_then_clears() {
+        // Selection wins over paste: 框选 → 右键(复制). The highlight is
+        // dropped so the following right-click pastes instead of
+        // re-copying stale text.
+        assert_eq!(
+            right_click_action(true, true),
+            RightClickAction::CopyThenClear
+        );
+        assert_eq!(
+            right_click_action(true, false),
+            RightClickAction::CopyThenClear
+        );
+    }
+
+    #[test]
+    fn right_click_without_selection_pastes_only_when_enabled() {
+        assert_eq!(right_click_action(false, true), RightClickAction::Paste);
+        assert_eq!(right_click_action(false, false), RightClickAction::None);
+    }
+
     #[test]
     fn ev_helper_still_compiles() {
         let _ = ev(down_left(), 0, 0, KeyModifiers::NONE);
@@ -1458,5 +1691,198 @@ mod p0_2_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    //! Scroll-during-selection regressions. The full `PtyPane::on_mouse`
+    //! needs a live `Session` (real PTY child), so these exercise the
+    //! same kernels the handlers call: `selection_begin_or_extend`,
+    //! `selection_extend_to`, `grid_point_drag`, `edge_scroll_delta`,
+    //! and the Term-level rotation/viewport-scroll semantics they rely
+    //! on.
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::selection::SelectionRange;
+    use alacritty_terminal::term::{Config as TermConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+    use std::time::Duration;
+
+    /// Static dims with an explicit history so `topmost_line()`
+    /// (= -history) is meaningful for the drag-clamp tests.
+    #[derive(Copy, Clone, Debug)]
+    struct TestDims {
+        columns: usize,
+        screen_lines: usize,
+        history: usize,
+    }
+
+    impl Dimensions for TestDims {
+        fn total_lines(&self) -> usize {
+            self.screen_lines + self.history
+        }
+        fn screen_lines(&self) -> usize {
+            self.screen_lines
+        }
+        fn columns(&self) -> usize {
+            self.columns
+        }
+    }
+
+    /// 8 cols × 3 rows with "0\r\n1\r\n2\r\n3\r\n4\r\n5" fed in —
+    /// 3 visible rows ("3","4","5") + 3 lines of history ("0","1","2"),
+    /// mirroring session.rs's `term_with_history`.
+    fn term_with_history() -> Term<VoidListener> {
+        let dims = TestDims {
+            columns: 8,
+            screen_lines: 3,
+            history: 0,
+        };
+        let mut term = Term::new(
+            TermConfig::default(),
+            &dims,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, b"0\r\n1\r\n2\r\n3\r\n4\r\n5");
+        term
+    }
+
+    fn pt(line: i32, col: usize) -> Point {
+        Point::new(Line(line), Column(col))
+    }
+
+    fn range_of(term: &Term<VoidListener>) -> Option<SelectionRange> {
+        term.selection.as_ref().and_then(|s| s.to_range(term))
+    }
+
+    #[test]
+    fn drag_both_directions_inclusive() {
+        // Forward drag: anchor (0,0), extend to (2,3).
+        let mut term = term_with_history();
+        selection_begin_or_extend(
+            &mut term.selection,
+            SelectionType::Simple,
+            Some(pt(0, 0)),
+            pt(0, 0),
+        );
+        selection_extend_to(&mut term.selection, pt(2, 3));
+        let r = range_of(&term).expect("range");
+        assert_eq!(r.start, pt(0, 0));
+        assert_eq!(r.end, pt(2, 3));
+        assert!(r.contains(pt(0, 0)));
+        assert!(r.contains(pt(2, 3)));
+        assert!(r.contains(pt(1, 1)));
+
+        // Backward drag: anchor (2,3), extend up to (0,0) — the
+        // original bug was an exclusive end cell (last char missing).
+        let mut term = term_with_history();
+        selection_begin_or_extend(
+            &mut term.selection,
+            SelectionType::Simple,
+            Some(pt(2, 3)),
+            pt(2, 3),
+        );
+        selection_extend_to(&mut term.selection, pt(0, 0));
+        let r = range_of(&term).expect("range");
+        assert_eq!(r.start, pt(0, 0));
+        assert_eq!(r.end, pt(2, 3));
+        assert!(r.contains(pt(2, 3)));
+    }
+
+    #[test]
+    fn viewport_scroll_keeps_absolute_anchor() {
+        // Regression: a selection anchored in *viewport* coords cleared
+        // or drifted when the user wheel-scrolled mid-drag. Anchored in
+        // absolute grid coords, only the visible window moves.
+        let mut term = term_with_history();
+        selection_begin_or_extend(
+            &mut term.selection,
+            SelectionType::Simple,
+            Some(pt(0, 0)),
+            pt(0, 0),
+        );
+        selection_extend_to(&mut term.selection, pt(2, 3));
+        // Wheel up 2 lines: display_offset 0 → 2. Selection must be
+        // untouched in absolute coords.
+        term.scroll_display(Scroll::Delta(2));
+        let r = range_of(&term).expect("range");
+        assert_eq!(r.start, pt(0, 0));
+        assert_eq!(r.end, pt(2, 3));
+    }
+
+    #[test]
+    fn streaming_output_rotates_selection() {
+        // Live output while a selection exists scrolls the grid up; the
+        // selection must rotate with the content (alacritty does this
+        // in scroll_up_relative) instead of pointing at stale lines.
+        let mut term = term_with_history();
+        // Anchor on history line -1 ("2"), extend to visible line 1.
+        selection_begin_or_extend(
+            &mut term.selection,
+            SelectionType::Simple,
+            Some(pt(-1, 0)),
+            pt(-1, 0),
+        );
+        selection_extend_to(&mut term.selection, pt(1, 3));
+        // One more output line: every existing line's storage coord
+        // drops by 1 ("2" -1 → -2, visible line 1 → 0).
+        let mut p: Processor = Processor::new();
+        p.advance(&mut term, b"\r\n6");
+        let r = range_of(&term).expect("rotate kept selection");
+        assert_eq!(r.start, pt(-2, 0));
+        assert_eq!(r.end, pt(0, 3));
+    }
+
+    #[test]
+    fn edge_scroll_delta_directions() {
+        let inner = Rect::new(5, 5, 10, 10);
+        assert_eq!(edge_scroll_delta(4, inner), 1); // above top
+        assert_eq!(edge_scroll_delta(5, inner), 0); // first inner row
+        assert_eq!(edge_scroll_delta(14, inner), 0); // last inner row
+        assert_eq!(edge_scroll_delta(15, inner), -1); // below bottom
+        assert_eq!(edge_scroll_delta(9999, inner), -1);
+        assert_eq!(edge_scroll_delta(0, Rect::new(0, 0, 5, 0)), 0); // zero height
+    }
+
+    #[test]
+    fn grid_point_drag_clamps_to_grid_bounds() {
+        // history 3 → topmost_line = -3, bottommost = 2, last col 7.
+        let dims = TestDims {
+            columns: 8,
+            screen_lines: 3,
+            history: 3,
+        };
+        let inner = Rect::new(1, 1, 8, 3);
+        // Drag inside the pane at screen row 1 (top of inner), offset 0.
+        assert_eq!(grid_point_drag(4, 1, inner, 0, &dims), pt(0, 3));
+        // Horizontal overshoot clamps to the last content column.
+        assert_eq!(grid_point_drag(200, 1, inner, 0, &dims), pt(0, 7));
+        // Vertical overshoot above the viewport with display_offset 2
+        // extrapolates past the top and clamps at topmost (-3).
+        assert_eq!(grid_point_drag(4, 0, inner, 2, &dims), pt(-3, 3));
+        // Vertical overshoot below clamps at bottommost (2).
+        assert_eq!(grid_point_drag(4, 99, inner, 2, &dims), pt(2, 3));
+    }
+
+    #[test]
+    fn bare_click_protocol_keeps_streak_primed() {
+        // A bare Down/Up (no Drag) must clear the seeded single-cell
+        // selection WITHOUT resetting the click streak — the Up handler
+        // inlines the clear instead of calling `clear_selection`.
+        let mut term = term_with_history();
+        let mut streak = ClickStreak::default();
+        let now = Instant::now();
+        let g = streak.begin(pt(0, 0), now);
+        assert_eq!(g, Granularity::Char);
+        selection_begin_or_extend(&mut term.selection, selection_ty(g), None, pt(0, 0));
+        assert!(term.selection.is_some());
+        // Bare-click Up clears only the selection (inlined in the
+        // handler), leaving the streak intact.
+        term.selection = None;
+        let g2 = streak.begin(pt(0, 0), now + Duration::from_millis(100));
+        assert_eq!(g2, Granularity::Word);
     }
 }
